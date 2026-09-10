@@ -430,11 +430,17 @@ $("btn_connect").addEventListener("click", async () => {
     sel.innerHTML = "";
     const used = new Set();
     const cfgFrom = (CFG.from || "").trim();
-    const localPart = cfgFrom.includes("@") ? cfgFrom.split("@")[0] : "";
+    // config.from may be a display name ("Acme Labs <hello@example.com>"); the
+    // dropdown needs the bare address to build per-domain options from, and the
+    // name itself so every option shows "Acme Labs <hello@domain>" to recipients.
+    const cfgAddr = (cfgFrom.match(/<([^>]+)>/) || [null, cfgFrom])[1].trim();
+    const cfgName = cfgFrom.includes("<") ? cfgFrom.split("<")[0].trim().replace(/^"|"$/g, "") : "";
+    const localPart = cfgAddr.includes("@") ? cfgAddr.split("@")[0] : "";
     (d.data || []).forEach((x) => {
       if (x.status === "verified" && !used.has(x.name)) {
         used.add(x.name);
-        const fromVal = (localPart ? localPart + "@" : "") + x.name;
+        const addr = (localPart ? localPart + "@" : "") + x.name;
+        const fromVal = cfgName ? `${cfgName} <${addr}>` : addr;
         sel.insertAdjacentHTML("beforeend", `<option value="${esc(fromVal)}">${esc(fromVal)}</option>`);
       }
     });

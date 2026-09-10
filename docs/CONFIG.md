@@ -35,8 +35,8 @@ token and store path are never exposed**.
 | `brand.logoInitials` | string | `PAD` | 2–3 letters in the header logo tile. |
 | `brand.tagline` | string | generic | Header sub-line. |
 | `brand.accentColor` | string | `""` | Optional CSS colour (e.g. `#0E7A66`); overrides the `--brand` accent. |
-| `from` | string | `""` | Default sender. Also the local-part source for the From dropdown built from Resend's verified domains. |
-| `replyTo` | string | `""` | Default Reply-To (falls back to From). |
+| `from` | string | `""` | Default sender. Accepts a display name — `Acme Labs <hello@example.com>` — which is what recipients see in their inbox; a bare address shows the address instead. Also the local-part source for the From dropdown built from Resend's verified domains (each option carries the display name when one is set). |
+| `replyTo` | string | `""` | Default Reply-To (falls back to From). Use a bare address here. |
 | `signature.html` | string | `""` | Signature block inserted by the **Signature** button and by `{{signature}}` in templates. |
 | `signature.text` | string | `""` | Plain-text signature (documentation / future use). |
 | `labels.*` | string | generic | Section headings: `composeTitle`, `draftsTitle`, `sentTitle`, `receivedTitle`, `footer`. |

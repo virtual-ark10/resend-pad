@@ -1,0 +1,19 @@
+.git
+.gitignore
+.env
+.env.local
+*.env
+*.log
+node_modules
+__pycache__
+*.pyc
+.DS_Store
+
+# runtime state and host-only material - never baked into the image
+data
+config.json
+docs
+deploy
+tools
+watchdog.sh
+add_caddy_route.py

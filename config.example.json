@@ -9,7 +9,7 @@
     "tagline": "Outbound + inbox · powered by Resend",
     "accentColor": ""
   },
-  "from": "hello@acme.example",
+  "from": "Acme Labs <hello@acme.example>",
   "replyTo": "hello@acme.example",
   "signature": {
     "html": "<p>Best,<br>Your Name<br>Acme Labs · <a href=\"https://acme.example\">acme.example</a></p>",

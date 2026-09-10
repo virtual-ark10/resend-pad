@@ -1,0 +1,66 @@
+# Email pad - single-service compose file.
+#
+# Same file runs on a laptop and on a VPS: `docker compose up -d --build`.
+# Moving hosts = copy this directory (or the image + .env + config.json + data/)
+# and run the same command.
+#
+# Deliberately published on 127.0.0.1 only. A reverse proxy on the host
+# terminates TLS and proxies to it, so the repo's add_caddy_route.py keeps
+# working unchanged:
+#   python3 add_caddy_route.py --path /pad --port 3001
+services:
+  pad:
+    build: .
+    image: pad-kit:latest
+    container_name: pad-kit
+    restart: unless-stopped
+
+    # Secrets and overrides. Never baked into the image (.env is gitignored).
+    env_file:
+      - .env
+    environment:
+      PORT: "3001"
+      DATA_DIR: /app/data
+
+    ports:
+      # Host port is parameterised so several pads can coexist on one host:
+      # set PAD_HOST_PORT in .env. Container always listens on 3001.
+      - "127.0.0.1:${PAD_HOST_PORT:-3001}:3001"
+
+    volumes:
+      # The queue and logs. A bind mount (not a named volume) so the whole pad
+      # moves to a new VPS by copying this one folder.
+      - ./data:/app/data
+      # Branding/templates, editable without a rebuild.
+      - ./config.json:/app/config.json:ro
+
+    # Hardening: no root filesystem writes, no capabilities, no privilege gain.
+    # The app only writes inside /app/data (and /tmp for node internals).
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+    # Resource ceiling. The pad measures ~18 MiB RSS / ~0% CPU idle, so these
+    # are generous; they exist because a small host may have no swap, and there
+    # an unbounded spike means the OOM killer picks a victim - possibly a more
+    # important service sharing the box.
+    mem_limit: 192m
+    cpus: 0.5
+    pids_limit: 128
+
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://127.0.0.1:3001/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
