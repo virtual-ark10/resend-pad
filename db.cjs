@@ -264,8 +264,10 @@ function open(dataDir, opts = {}) {
     if (!cols.includes('processed_at')) db.exec('ALTER TABLE events ADD COLUMN processed_at TEXT');
   });
   withRetry('schema', () => db.exec(SCHEMA));
-  withRetry('schema_version', () => db.prepare('INSERT INTO meta(key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING')
-    .run('schema_version', String(SCHEMA_VERSION)));
+  // Upsert: an existing store reports the version this build actually creates,
+  // instead of the first value ever written.
+  withRetry('schema_version', () => db.prepare(`INSERT INTO meta(key, value) VALUES (?, ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run('schema_version', String(SCHEMA_VERSION)));
 
   const store = new Store(db, dataDir, file, opts);
   store.importLegacy();

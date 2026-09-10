@@ -81,6 +81,8 @@ services:
       - .env
     environment:
       PORT: "3002"
+      # Reachable from the pad container on the compose network.
+      HOST: "0.0.0.0"
       DATA_DIR: /app/data
       PAD_URL: http://pad:3001
       SERVICE_NAME: leads
