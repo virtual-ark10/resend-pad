@@ -1,0 +1,18 @@
+# --- per-install secrets & config (never commit these) ---
+.env
+.env.local
+config.json
+*.env
+
+# --- runtime data (drafts, send log, webhook archive) ---
+data/*
+!data/.gitkeep
+
+# --- logs ---
+*.log
+
+# --- tooling noise ---
+node_modules/
+__pycache__/
+*.pyc
+.DS_Store

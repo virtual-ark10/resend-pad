@@ -1,0 +1,11 @@
+[Unit]
+# systemd USER timer: run the pad watchdog every minute instead of using cron.
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now pad-watchdog.timer
+#   systemctl --user list-timers pad-watchdog.timer
+Description=Per-minute health watchdog for the email pad kit
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pad-kit
+ExecStart=%h/pad-kit/watchdog.sh

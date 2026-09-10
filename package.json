@@ -1,0 +1,15 @@
+{
+  "name": "pad-kit",
+  "version": "1.0.0",
+  "description": "Brand-agnostic, config-driven email pad on top of the Resend API (zero dependencies)",
+  "main": "server.cjs",
+  "scripts": {
+    "start": "./boot.sh",
+    "dev": "node server.cjs"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "license": "MIT",
+  "private": false
+}

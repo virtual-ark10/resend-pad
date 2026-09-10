@@ -1,0 +1,744 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Email Pad</title>
+<!--
+  Single self-contained client. HARD RULE (learned the hard way): zero external
+  assets, zero CDNs, zero build step. The brand name, tab labels, composer
+  templates and limits are all rendered from GET /api/config at runtime; the
+  DEFAULTS object below is the fallback used when config is unavailable.
+-->
+<style>
+  :root {
+    --brand: #0E7A66;
+    --brand-dark: #0A5F4F;
+    --bg: #F7F8FA;
+    --card: #FFFFFF;
+    --line: #E3E6EB;
+    --ink: #1B2430;
+    --muted: #6B7280;
+    --ok: #138A5A;
+    --err: #C0392B;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    font-size: 14px; line-height: 1.5;
+  }
+  .wrap { max-width: 960px; margin: 0 auto; padding: 16px 20px; }
+
+  header.row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-bottom: 14px; }
+  .logo {
+    width: 34px; height: 34px; border-radius: 8px; background: var(--brand);
+    color: #fff; font-weight: 800; font-size: 15px; display: grid; place-items: center;
+  }
+  h1 { font-size: 17px; margin: 0; }
+  .sub { font-size: 12px; color: var(--muted); }
+  .chip {
+    font-size: 11px; padding: 2px 8px; border-radius: 999px; background: #E8F3EE;
+    color: var(--brand-dark); border: 1px solid #C8E3D8;
+  }
+  .token-box { display: flex; gap: 8px; margin-left: auto; }
+  input[type=password], input[type=text], select, textarea {
+    font: inherit; padding: 7px 10px; border: 1px solid var(--line); border-radius: 8px;
+    background: #fff; color: var(--ink);
+  }
+  input:focus, select:focus { outline: 2px solid #9ED8C8; outline-offset: 1px; }
+  button {
+    font: inherit; padding: 7px 14px; border-radius: 8px; cursor: pointer;
+    border: 1px solid var(--line); background: #fff; color: var(--ink);
+  }
+  button.primary { background: var(--brand); border-color: var(--brand); color: #fff; }
+  button.primary:hover { background: var(--brand-dark); }
+  button.ghost { background: #fff; }
+  button:disabled { opacity: .55; cursor: not-allowed; }
+
+  .banner { display: none; }
+  .banner.show { display: block; margin: 0 0 12px; padding: 10px 14px; border-radius: 10px; }
+  .banner.ok { background: #E9F7EF; color: var(--ok); border: 1px solid #BFE8CF; }
+  .banner.err { background: #FDEDEC; color: var(--err); border: 1px solid #F3C1C0; }
+  .banner.fatal {
+    background: #FBE9E7; color: #7A1F17; border: 2px solid var(--err); font-weight: 600;
+  }
+
+  nav.tabs { display: flex; gap: 8px; margin: 0 0 18px; flex-wrap: wrap; }
+  .tab {
+    padding: 8px 16px; border-radius: 9px; border: 1px solid var(--line);
+    background: #fff; color: var(--muted); font-weight: 500; cursor: pointer;
+  }
+  .tab.active { background: var(--brand); border-color: var(--brand); color: #fff; }
+
+  .panel { display: none; background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 18px; }
+  .panel.active { display: block; }
+
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 12px; }
+  .grid3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; margin-bottom: 12px; }
+  label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 3px; }
+  .full { width: 100%; }
+
+  .editor {
+    border: 1px solid var(--line); border-radius: 8px; min-height: 180px;
+    padding: 10px 12px; font: inherit; color: var(--ink);
+  }
+  .editor:focus { outline: 2px solid #9ED8C8; outline-offset: 1px; }
+  .editor p { margin: 0 0 6px; }
+
+  .row-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 12px; }
+
+  .attach-list { display: flex; flex-wrap: wrap; gap: 8px; }
+  .attach {
+    font-size: 12px; background: #F1F3F6; border: 1px solid var(--line);
+    border-radius: 999px; padding: 3px 10px; display: inline-flex; align-items: center; gap: 6px;
+  }
+  .attach a { cursor: pointer; color: var(--err); text-decoration: none; }
+
+  .list-row { display: flex; align-items: center; gap: 10px; padding: 10px 12px; cursor: pointer; border-radius: 8px; }
+  .list-row:hover { background: #F2F4F7; }
+  .list-row + .list-row { border-top: 1px solid var(--line); }
+  .l-main { flex: 1; min-width: 0; }
+  .l-title { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .l-sub { font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .l-time { font-size: 12px; color: var(--muted); white-space: nowrap; }
+  .empty { color: var(--muted); padding: 16px 12px; font-size: 13px; }
+  .count { color: var(--muted); font-size: 12px; }
+
+  .chip-status { font-size: 11px; padding: 2px 9px; border-radius: 999px; white-space: nowrap; }
+  .st-delivered { background: #E1F5E6; color: #1C7A3D; }
+  .st-opened { background: #E6F3EE; color: var(--brand-dark); }
+  .st-clicked { background: #E8EDF9; color: #3B53A6; }
+  .st-sent { background: #E8F0F7; color: #2563A0; }
+  .st-bounced, .st-complained, .st-failed { background: #FDEDEC; color: var(--err); }
+  .st-scheduled { background: #F1F3F6; color: var(--muted); }
+  .st-default { background: #F1F3F6; color: var(--muted); }
+
+  .modal-mask {
+    position: fixed; inset: 0; background: rgba(15, 23, 42, .45);
+    display: none; align-items: center; justify-content: center; padding: 16px; z-index: 50;
+  }
+  .modal {
+    background: #fff; border-radius: 14px; max-width: 720px; max-height: 85vh;
+    width: 100%; overflow: auto; box-shadow: 0 20px 45px rgba(0,0,0,.22);
+  }
+  .modal-head {
+    display: flex; align-items: center; gap: 8px; padding: 12px 18px;
+    border-bottom: 1px solid var(--line); position: sticky; top: 0; background: #fff;
+  }
+  .modal-title { font-weight: 700; font-size: 15px; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .modal-x { cursor: pointer; font-size: 20px; color: var(--muted); line-height: 1; background: none; border: none; }
+  .modal-actions { display: flex; gap: 8px; flex-wrap: wrap; padding: 8px 18px; border-bottom: 1px solid var(--line); }
+  .modal-body { padding: 16px 18px; font-size: 14px; color: var(--ink); word-break: break-word; }
+  .modal-body .meta { font-size: 12px; color: var(--muted); margin: 0 0 10px; }
+  .modal-body img { max-width: 100%; }
+
+  footer { margin-top: 22px; color: var(--muted); font-size: 12px; }
+  @media (max-width: 620px) { .grid2, .grid3 { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body data-pad-version="3.0">
+<div class="wrap">
+
+  <header class="row">
+    <div class="logo" id="brand_logo">PAD</div>
+    <div>
+      <h1 id="brand_title">Email Pad</h1>
+      <div class="sub" id="brand_tagline">Outbound + inbox · powered by Resend</div>
+    </div>
+    <div class="token-box">
+      <input type="password" id="pad_token" placeholder="Pad token" style="width:170px" autocomplete="off">
+      <button id="btn_connect" class="primary">Connect</button>
+    </div>
+  </header>
+
+  <div id="banner" class="banner"></div>
+  <noscript><div class="banner fatal show">JavaScript is disabled — this pad cannot run without JS.</div></noscript>
+
+  <nav class="tabs" id="tabs"></nav>
+
+  <!-- ================= COMPOSE ================= -->
+  <section class="panel" id="panel-compose">
+    <div class="grid2">
+      <div>
+        <label for="f_from">From</label>
+        <select id="f_from" class="full"></select>
+      </div>
+      <div>
+        <label for="f_template">Template preset</label>
+        <select id="f_template" class="full"><option value="">— none —</option></select>
+      </div>
+    </div>
+    <div class="grid3">
+      <div><label for="v_company">Company</label><input id="v_company" class="full" placeholder="Acme Inc"></div>
+      <div><label for="v_first">First name</label><input id="v_first" class="full" placeholder="Jane"></div>
+      <div><label for="v_audience">Audience / context</label><input id="v_audience" class="full" placeholder="12,000 indie founders"></div>
+    </div>
+    <div class="grid2">
+      <div><label for="f_to">To</label><input id="f_to" class="full" placeholder="partner@acme.com"></div>
+      <div><label for="f_cc">CC</label><input id="f_cc" class="full" placeholder="(optional)"></div>
+    </div>
+    <div class="grid2">
+      <div><label for="f_subject">Subject</label><input id="f_subject" class="full"></div>
+      <div><label for="f_replyto">Reply-To</label><input id="f_replyto" class="full" placeholder="Default = From"></div>
+    </div>
+    <input type="hidden" id="f_inreply">
+    <input type="hidden" id="f_draft_id">
+
+    <div style="margin:10px 0 6px">
+      <label for="editor">Message</label>
+      <div class="editor-toolbar" style="margin:4px 0;display:flex;gap:6px">
+        <button type="button" id="btn_link" title="Select text, then turn it into a clickable link">Link</button>
+        <button type="button" id="btn_sig" title="Append the configured signature block">Signature</button>
+      </div>
+      <div id="editor" class="editor" contenteditable="true"><p>Write your email…</p></div>
+      <div style="font-size:11px;color:var(--muted);margin-top:2px" id="editor_hint">
+        Paste a bare URL and it becomes a clickable link automatically.
+      </div>
+    </div>
+
+    <div class="row-actions">
+      <label style="cursor:pointer;color:var(--brand);font-weight:600;margin:0">
+        + Attach files
+        <input type="file" id="f_files" multiple style="display:none">
+      </label>
+      <span class="attach-list" id="attach_list"></span>
+      <button id="btn_send" class="primary">Send email</button>
+      <span id="status_send" style="font-size:12px;color:var(--muted)"></span>
+    </div>
+  </section>
+
+  <!-- ================= DRAFTS ================= -->
+  <section class="panel" id="panel-drafts">
+    <h2 style="font-size:14px;margin:0 0 8px"><span id="lbl_drafts">Ready to send</span> <span class="count" id="draft_list_count"></span></h2>
+    <div id="draft_list"></div>
+  </section>
+
+  <!-- ================= SENT ================= -->
+  <section class="panel" id="panel-sent">
+    <h2 style="font-size:14px;margin:0 0 8px"><span id="lbl_sent">Sent emails</span> <span class="count" id="sent_count"></span></h2>
+    <div id="sent_list"></div>
+  </section>
+
+  <!-- ================= RECEIVED ================= -->
+  <section class="panel" id="panel-received">
+    <h2 style="font-size:14px;margin:0 0 8px"><span id="lbl_received">Received (last 30 days)</span> <span class="count" id="recv_count"></span></h2>
+    <div id="recv_list"></div>
+  </section>
+
+  <footer id="brand_footer">Self-contained client — no external assets, no build step.</footer>
+</div>
+
+<!-- ================= MODAL ================= -->
+<div class="modal-mask" id="modal_mask">
+  <div class="modal" style="pointer-events:auto" onclick="event.stopPropagation()">
+    <div class="modal-head">
+      <div class="modal-title" id="modal_title"></div>
+      <button class="modal-x" id="modal_close">×</button>
+    </div>
+    <div class="modal-actions" id="modal_actions"></div>
+    <div class="modal-body" id="modal_body"></div>
+  </div>
+</div>
+
+<script>
+"use strict";
+const PAD_VERSION = "3.0";
+const TOKEN_KEY = "pad_token"; // sessionStorage key (generic — no brand coupling)
+
+// Fallback config: used before /api/config resolves (or if it is unavailable).
+// Mirrors the server's DEFAULT_CONFIG + generic preset.
+const DEFAULTS = {
+  useCase: "generic",
+  brand: {
+    name: "Email Pad", productName: "Email Pad", siteUrl: "", logoInitials: "PAD",
+    tagline: "Outbound + inbox · powered by Resend", accentColor: ""
+  },
+  from: "", replyTo: "",
+  signature: { html: "", text: "" },
+  labels: {
+    composeTitle: "Compose", draftsTitle: "Ready to send", sentTitle: "Sent emails",
+    receivedTitle: "Received (last 30 days)",
+    footer: "Self-contained client — no external assets, no build step."
+  },
+  tabs: [
+    { id: "compose", label: "Compose" },
+    { id: "drafts", label: "Drafts" },
+    { id: "sent", label: "Sent" },
+    { id: "received", label: "Received" }
+  ],
+  templates: {
+    blank: { label: "Blank short note", subject: "", body: "<p>Hi {{first_name}},</p><p></p>{{signature}}" }
+  },
+  tracking: { openTracking: false, clickTracking: false, trackingSubdomain: "" },
+  limits: { ratePerMinute: 60, maxRecipients: 50, maxAttachmentMB: 8 },
+  outreach: { enabled: false, siteUrl: "" }
+};
+
+// ---------- tiny helpers ----------
+const $ = (s) => document.getElementById(s);
+const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const fmtDate = (iso) => {
+  if (!iso) return "";
+  try { const d = new Date(iso); return d.toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }); }
+  catch (e) { return String(iso); }
+};
+const statusChip = (s) => {
+  const map = { delivered: "st-delivered", opened: "st-opened", clicked: "st-clicked",
+    sent: "st-sent", bounced: "st-bounced", complained: "st-complained", failed: "st-failed", scheduled: "st-scheduled" };
+  return `<span class="chip-status ${map[s] || "st-default"}">${esc(s || "—")}</span>`;
+};
+function merge(base, over) {
+  if (over === null || over === undefined) return base;
+  if (Array.isArray(over)) return over.slice();
+  if (typeof over !== "object") return over;
+  const out = Object.assign({}, base || {});
+  Object.keys(over).forEach((k) => {
+    const o = over[k];
+    if (o && typeof o === "object" && !Array.isArray(o)) out[k] = merge(base ? base[k] : undefined, o);
+    else if (o !== null && o !== undefined) out[k] = o;
+  });
+  return out;
+}
+
+// ---------- state ----------
+let CFG = DEFAULTS;
+let token = "";
+try { token = sessionStorage.getItem(TOKEN_KEY) || ""; } catch (e) { /* storage blocked */ }
+let attachments = [];
+let editorHTML = "";
+let activeTabId = "";
+
+// ---------- status banner ----------
+function setStatus(text, ok) {
+  const b = $("banner");
+  b.className = "banner show " + (ok ? "ok" : "err");
+  b.textContent = text;
+}
+
+// ---------- config rendering ----------
+function applyConfig(cfg) {
+  CFG = merge(DEFAULTS, cfg || {});
+  // Collections are REPLACE, not merge: a configured template/tab list must not
+  // be unioned with the fallback set (otherwise the fallback's "blank" template
+  // leaks into every install).
+  if (cfg && cfg.templates && typeof cfg.templates === "object" && !Array.isArray(cfg.templates) && Object.keys(cfg.templates).length) CFG.templates = cfg.templates;
+  if (cfg && Array.isArray(cfg.tabs) && cfg.tabs.length) CFG.tabs = cfg.tabs;
+  const b = CFG.brand || {};
+  document.title = b.productName || b.name || "Email Pad";
+  $("brand_logo").textContent = b.logoInitials || (b.name || "PAD").slice(0, 3).toUpperCase();
+  $("brand_title").textContent = b.productName || b.name || "Email Pad";
+  $("brand_tagline").textContent = b.tagline || "";
+  const lbl = CFG.labels || {};
+  $("lbl_drafts").textContent = lbl.draftsTitle || "Ready to send";
+  $("lbl_sent").textContent = lbl.sentTitle || "Sent emails";
+  $("lbl_received").textContent = lbl.receivedTitle || "Received";
+  $("brand_footer").textContent = lbl.footer || (b.name ? b.name + " — " : "") + "powered by Resend.";
+  if (b.accentColor) {
+    document.documentElement.style.setProperty("--brand", b.accentColor);
+  }
+  const maxMB = (CFG.limits && CFG.limits.maxAttachmentMB) || 8;
+  const hint = $("editor_hint");
+  hint.textContent = "Paste a bare URL and it becomes a clickable link automatically." +
+    (CFG.outreach && CFG.outreach.enabled ? " Tracked links are re-minted/verified at send time." : "");
+  renderTabs();
+  renderTemplates();
+  $("f_files").closest("label").title = "Max " + maxMB + "MB per file";
+}
+
+function renderTabs() {
+  const tabs = (Array.isArray(CFG.tabs) && CFG.tabs.length ? CFG.tabs : DEFAULTS.tabs).filter((t) => t && t.id && t.enabled !== false);
+  const nav = $("tabs");
+  nav.innerHTML = tabs.map((t) =>
+    `<button class="tab" data-tab="${esc(t.id)}">${esc(t.label || t.id)} <span class="count" id="cnt_${esc(t.id)}"></span></button>`
+  ).join("");
+  tabs.forEach((t) => {
+    const panel = $("panel-" + t.id);
+    if (panel) panel.classList.toggle("hidden-by-config", false);
+  });
+  document.querySelectorAll(".panel").forEach((p) => {
+    const id = p.id.replace("panel-", "");
+    if (!tabs.some((t) => t.id === id)) p.classList.remove("active");
+    p.style.display = tabs.some((t) => t.id === id) ? "" : "none";
+  });
+  nav.querySelectorAll(".tab").forEach((el) => el.addEventListener("click", () => switchTab(el.dataset.tab)));
+  const first = tabs.some((t) => t.id === "compose") ? "compose" : (tabs[0] ? tabs[0].id : "compose");
+  switchTab(first);
+}
+
+function renderTemplates() {
+  const sel = $("f_template");
+  const tpl = CFG.templates || {};
+  const opts = Object.keys(tpl).map((k) => `<option value="${esc(k)}">${esc(tpl[k].label || k)}</option>`).join("");
+  sel.innerHTML = `<option value="">— none —</option>` + opts;
+}
+
+// ---------- API ----------
+async function api(path, options) {
+  const res = await fetch(path, Object.assign({ headers: {} }, options || {}));
+  if (res.status === 401) {
+    setStatus("Not connected — enter the pad token above and click Connect.", false);
+    throw new Error("unauthorized");
+  }
+  if (res.status === 429) { setStatus("Rate limit hit — wait a few seconds.", false); throw new Error("rate limited"); }
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || data.message || ("HTTP " + res.status));
+  return data;
+}
+function authed(method, body) {
+  return { method, headers: { "X-Pad-Token": token, "Content-Type": "application/json" }, body: body ? JSON.stringify(body) : undefined };
+}
+
+// ---------- tabs ----------
+function switchTab(tab) {
+  if (!tab) return;
+  const panel = $("panel-" + tab);
+  const btn = document.querySelector('.tab[data-tab="' + tab + '"]');
+  if (!panel || !btn) return;
+  activeTabId = tab;
+  document.querySelectorAll(".panel").forEach((p) => p.classList.remove("active"));
+  document.querySelectorAll(".tab").forEach((t) => t.classList.remove("active"));
+  panel.classList.add("active");
+  btn.classList.add("active");
+  if (tab === "drafts") loadDrafts();
+  if (tab === "sent") loadSent();
+  if (tab === "received") loadReceived();
+}
+
+// ---------- connect ----------
+async function refreshConfig() {
+  try {
+    const d = await api("api/config", authed("GET"));
+    applyConfig(d);
+    return true;
+  } catch (e) {
+    applyConfig(DEFAULTS); // sane fallback — never a blank page
+    return false;
+  }
+}
+
+$("btn_connect").addEventListener("click", async () => {
+  const raw = $("pad_token").value.trim();
+  if (!raw) return setStatus("Enter the pad token.", false);
+  token = raw;
+  try { sessionStorage.setItem(TOKEN_KEY, token); } catch (e) {}
+  try {
+    await refreshConfig(); // brand/labels/tabs/templates from config.json
+    const d = await api("api/domains", authed("GET"));
+    const doms = (d.data || []).filter((x) => x.status === "verified");
+    const sel = $("f_from");
+    sel.innerHTML = "";
+    const used = new Set();
+    const cfgFrom = (CFG.from || "").trim();
+    const localPart = cfgFrom.includes("@") ? cfgFrom.split("@")[0] : "";
+    (d.data || []).forEach((x) => {
+      if (x.status === "verified" && !used.has(x.name)) {
+        used.add(x.name);
+        const fromVal = (localPart ? localPart + "@" : "") + x.name;
+        sel.insertAdjacentHTML("beforeend", `<option value="${esc(fromVal)}">${esc(fromVal)}</option>`);
+      }
+    });
+    if (cfgFrom) sel.insertAdjacentHTML("afterbegin", `<option value="${esc(cfgFrom)}">${esc(cfgFrom)}</option>`);
+    if (doms.length === 0) setStatus("Connected, but no verified sender domains in Resend yet.", true);
+    else setStatus("Connected! Verified senders loaded.", true);
+    loadDrafts(); loadSent(); loadReceived();
+  } catch (e) {
+    setStatus("Connection failed: " + e.message, false);
+  }
+});
+
+// ---------- editor ----------
+$("editor").addEventListener("input", () => { editorHTML = $("editor").innerHTML; });
+
+$("btn_link").addEventListener("click", () => {
+  const ed = $("editor");
+  let sel = "";
+  try { sel = (getSelection() || "").toString(); } catch (e) { sel = ""; }
+  const url = (prompt("Link URL:", "https://") || "").trim();
+  if (!url) return;
+  ed.focus();
+  let ok = false;
+  try { ok = document.execCommand("createLink", false, url); } catch (e) { ok = false; }
+  if (ok) {
+    editorHTML = ed.innerHTML;
+    if (!sel) setStatus("Linked. Select existing text next time to turn it into a link.", true);
+  } else {
+    setStatus("This browser blocked createLink — paste the URL as text instead.", false);
+  }
+});
+
+$("btn_sig").addEventListener("click", () => {
+  const html = (CFG.signature && CFG.signature.html) || "";
+  if (!html) return setStatus("No signature configured (config.json -> signature.html).", false);
+  const ed = $("editor");
+  ed.innerHTML = ed.innerHTML + html;
+  editorHTML = ed.innerHTML;
+  setStatus("Signature inserted.", true);
+});
+
+// Paste a bare URL -> insert it as a clickable link immediately.
+$("editor").addEventListener("paste", (e) => {
+  const ed = $("editor");
+  const dt = e.clipboardData || (window.clipboardData || null);
+  if (!dt) return;
+  const t = (dt.getData("text/plain") || "").trim();
+  if (!/^https?:\/\/\S+$/.test(t)) return;
+  let ok = false;
+  try { ok = document.execCommand("insertHTML", false, `<a href="${t}">${t}</a>`); } catch (err) { ok = false; }
+  if (ok) { e.preventDefault(); editorHTML = ed.innerHTML; setStatus("Pasted as a clickable link.", true); }
+});
+
+// ---------- attachments ----------
+$("f_files").addEventListener("change", async (e) => {
+  const maxMB = (CFG.limits && CFG.limits.maxAttachmentMB) || 8;
+  for (const f of Array.from(e.target.files || [])) {
+    if (f.size > maxMB * 1024 * 1024) { setStatus(f.name + " is over " + maxMB + "MB — skipped.", false); continue; }
+    try {
+      const buf = await f.arrayBuffer();
+      const bytes = new Uint8Array(buf);
+      let bin = "";
+      const CHUNK = 0x8000;
+      for (let i = 0; i < bytes.length; i += CHUNK) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+      attachments.push({ filename: f.name, content: window.btoa(bin) });
+      renderAttachments();
+    } catch (err) {
+      setStatus("Could not read " + f.name + ": " + err.message, false);
+    }
+  }
+  e.target.value = "";
+});
+function renderAttachments() {
+  $("attach_list").innerHTML = attachments.map((a, i) =>
+    `<span class="attach">${esc(a.filename)} <a title="remove" onclick="attachments.splice(${i},1);renderAttachments()">✕</a></span>`).join("");
+}
+
+// ---------- templates ----------
+$("f_template").addEventListener("change", () => {
+  const key = $("f_template").value;
+  const t = (CFG.templates || {})[key];
+  if (!t) return;
+  const b = CFG.brand || {};
+  const vars = {
+    "{{company}}": $("v_company").value.trim() || "{{company}}",
+    "{{first_name}}": $("v_first").value.trim() || "{{first_name}}",
+    "{{audience}}": $("v_audience").value.trim() || "{{audience}}",
+    "{{product}}": b.productName || b.name || "our product",
+    "{{brand}}": b.name || "",
+    "{{site_url}}": b.siteUrl || "",
+    "{{signature}}": (CFG.signature && CFG.signature.html) || ""
+  };
+  let subject = t.subject || "", body = t.body || "";
+  Object.keys(vars).forEach((k) => { subject = subject.split(k).join(vars[k]); body = body.split(k).join(vars[k]); });
+  $("f_subject").value = subject;
+  $("editor").innerHTML = body;
+  editorHTML = body;
+});
+
+// ---------- send ----------
+$("btn_send").addEventListener("click", async () => {
+  const st = $("status_send");
+  st.textContent = "Sending…";
+  const from = $("f_from").value || (CFG.from || "");
+  const to = $("f_to").value.trim();
+  if (!from || !to) { st.textContent = "From and To are required."; return; }
+  const toList = to.split(",").map((s) => s.trim()).filter(Boolean);
+  const maxR = (CFG.limits && CFG.limits.maxRecipients) || 50;
+  if (toList.length > maxR) { st.textContent = "Too many recipients (max " + maxR + ")."; return; }
+  const replyTo = $("f_replyto").value.trim() || CFG.replyTo || from;
+  const ed = $("editor");
+  const payload = {
+    from,
+    to: toList,
+    cc: $("f_cc").value.split(",").map((s) => s.trim()).filter(Boolean),
+    subject: $("f_subject").value.trim(),
+    html: editorHTML || ed.innerHTML,
+    text: (ed.innerText || ed.textContent || "").trim(),
+    reply_to: [replyTo],
+    attachments: attachments
+  };
+  const inReply = $("f_inreply").value;
+  if (inReply) payload.headers = { "In-Reply-To": inReply, "References": inReply };
+  const draftId = $("f_draft_id").value.trim();
+  try {
+    const sendPath = draftId ? "api/drafts/" + encodeURIComponent(draftId) + "/send" : "api/send";
+    await api(sendPath, authed("POST", payload));
+    st.textContent = "Sent ✔";
+    setStatus(draftId ? "Draft sent and removed from the queue." : "Email accepted by Resend.", true);
+    ed.innerHTML = "<p>Write your email…</p>";
+    editorHTML = "";
+    $("f_to").value = ""; $("f_cc").value = ""; $("f_subject").value = ""; $("f_inreply").value = "";
+    $("f_draft_id").value = "";
+    attachments = []; renderAttachments();
+    if (draftId) loadDrafts();
+  } catch (e) {
+    st.textContent = "Failed: " + e.message;
+    setStatus("Send failed: " + e.message, false);
+  }
+});
+
+// ---------- drafts ----------
+let draftsCache = [];
+function textToHtml(t) {
+  const paras = String(t || "").replace(/\r\n/g, "\n").split(/\n{2,}/).map((p) => p.replace(/\n/g, "<br>"));
+  return paras.filter((p) => p.trim()).map((p) => "<p>" + p + "</p>").join("");
+}
+async function loadDrafts() {
+  const el = $("draft_list");
+  if (!el) return;
+  el.innerHTML = '<div class="empty">Loading…</div>';
+  try {
+    const d = await api("api/drafts", authed("GET"));
+    draftsCache = d.data || [];
+    if ($("cnt_drafts")) $("cnt_drafts").textContent = draftsCache.length ? "(" + draftsCache.length + ")" : "";
+    $("draft_list_count").textContent = "(" + draftsCache.length + ")";
+    if (draftsCache.length === 0) { el.innerHTML = '<div class="empty">No drafts in the queue.</div>'; return; }
+    el.innerHTML = draftsCache.map((m) =>
+      `<div class="list-row" onclick="openDraft('${esc(String(m.id))}')">
+         <div class="l-main">
+           <div class="l-title">${esc(m.subject || "(no subject)")}</div>
+           <div class="l-sub">to ${esc(String(m.to || ""))}${m.cc ? " · cc " + esc(String(m.cc)) : ""}${m.company ? " · " + esc(m.company) : ""}</div>
+         </div>
+         <div class="l-time">${fmtDate(m.created_at)}</div>
+         <span style="margin-left:6px;cursor:pointer;color:var(--err);font-size:16px;line-height:1" title="Discard draft"
+               onclick="event.stopPropagation();discardDraft('${esc(String(m.id))}')">✕</span>
+       </div>`).join("");
+  } catch (e) { el.innerHTML = '<div class="empty">' + esc(e.message) + "</div>"; }
+}
+async function openDraft(id) {
+  const m = draftsCache.find((x) => String(x.id) === String(id));
+  if (!m) { setStatus("Draft not found in queue.", false); return; }
+  switchTab("compose");
+  const fromSel = $("f_from");
+  $("f_from").value = m.from || CFG.from || "";
+  if (!$("f_from").value && fromSel.options.length) $("f_from").value = fromSel.options[0].value;
+  $("f_to").value = m.to || "";
+  $("f_cc").value = m.cc || "";
+  $("f_subject").value = m.subject || "";
+  $("f_replyto").value = m.reply_to || "";
+  $("f_inreply").value = m.in_reply_to || "";
+  $("f_draft_id").value = String(m.id);
+  $("editor").innerHTML = m.html || textToHtml(m.text || "");
+  editorHTML = $("editor").innerHTML;
+  attachments = [];
+  renderAttachments();
+  setStatus("Draft loaded — review, edit if needed, then press Send email. It leaves the queue when sent.", true);
+}
+async function discardDraft(id) {
+  if (!confirm("Discard this draft? It will be removed from the queue without sending.")) return;
+  try {
+    await api("api/drafts/" + encodeURIComponent(id), authed("DELETE"));
+    setStatus("Draft discarded.", true);
+    loadDrafts();
+  } catch (e) { setStatus("Failed to discard: " + e.message, false); }
+}
+
+// ---------- sent ----------
+async function loadSent() {
+  const el = $("sent_list");
+  if (!el) return;
+  el.innerHTML = '<div class="empty">Loading…</div>';
+  try {
+    const d = await api("api/sent", authed("GET"));
+    const items = d.data || [];
+    $("sent_count").textContent = "(" + items.length + ")";
+    if (items.length === 0) { el.innerHTML = '<div class="empty">No sent emails yet.</div>'; return; }
+    el.innerHTML = items.map((m) =>
+      `<div class="list-row" data-id="${esc(m.id)}" onclick="viewSent('${esc(String(m.id))}')">
+         <div class="l-main">
+           <div class="l-title">${esc(m.subject || "(no subject)")}</div>
+           <div class="l-sub">to ${esc((m.to || []).join(", "))}</div>
+         </div>
+         <div class="l-time">${fmtDate(m.created_at)}</div>
+         ${statusChip(m.last_event)}
+       </div>`).join("");
+  } catch (e) { el.innerHTML = '<div class="empty">' + esc(e.message) + "</div>"; }
+}
+async function viewSent(id) {
+  try {
+    const m = await api("api/email/" + encodeURIComponent(id), authed("GET"));
+    showModal(m.subject || "(no subject)",
+      `<div class="meta">From: ${esc(m.from)}<br>To: ${esc((m.to || []).join(", "))}<br>Sent: ${fmtDate(m.created_at)} ${statusChip(m.last_event)}</div>` +
+      (m.html || esc(m.text || "")),
+      '<button class="ghost" onclick="closeModal()">Close</button>');
+  } catch (e) { setStatus("Failed to load email: " + e.message, false); }
+}
+
+// ---------- received ----------
+async function loadReceived() {
+  const el = $("recv_list");
+  if (!el) return;
+  el.innerHTML = '<div class="empty">Loading…</div>';
+  try {
+    const d = await api("api/received?limit=50", authed("GET"));
+    const items = d.data || [];
+    $("recv_count").textContent = "(" + items.length + ")";
+    if (items.length === 0) { el.innerHTML = '<div class="empty">No received emails. Make sure your domain MX points at Resend.</div>'; return; }
+    el.innerHTML = items.map((m) =>
+      `<div class="list-row" onclick="viewReceived('${esc(String(m.id))}')">
+         <div class="l-main">
+           <div class="l-title">${esc(m.subject || "(no subject)")}</div>
+           <div class="l-sub">from ${esc(String(m.from || ""))}</div>
+         </div>
+         <div class="l-time">${fmtDate(m.created_at)}</div>
+       </div>`).join("");
+  } catch (e) { el.innerHTML = '<div class="empty">' + esc(e.message) + "</div>"; }
+}
+async function viewReceived(id) {
+  try {
+    const m = await api("api/received/" + encodeURIComponent(id), authed("GET"));
+    const fromRaw = String((m.headers && m.headers.from) || m.from || "");
+    const fromAddr = String(m.from || "").split("<").pop().replace(">", "").trim();
+    const title = m.subject || "(no subject)";
+    const bodyHtml = m.html || esc(m.text || "(no body)");
+    const actions =
+      `<button class="primary" onclick="replyTo('${esc(fromAddr)}','${esc(title)}','${esc(String(m.message_id || ""))}')">Reply</button>
+       <button class="ghost" onclick="closeModal()">Close</button>`;
+    showModal(title,
+      `<div class="meta">From: ${esc(fromRaw)}<br>Received: ${fmtDate(m.created_at)}<br>For: ${esc((m.received_for || m.to || []).join(", "))}</div>` + bodyHtml,
+      actions);
+  } catch (e) { setStatus("Failed to load email: " + e.message, false); }
+}
+
+function replyTo(addr, subject, messageId) {
+  closeModal();
+  switchTab("compose");
+  $("f_to").value = addr;
+  $("f_subject").value = subject.toLowerCase().startsWith("re:") ? subject : "Re: " + subject;
+  $("f_inreply").value = messageId;
+  $("f_replyto").value = "";
+  $("editor").innerHTML = "<p>Write your email…</p>";
+  editorHTML = "";
+  setStatus("Reply drafted — send address and thread are linked automatically.", true);
+}
+
+// ---------- modal ----------
+function showModal(title, bodyHtml, actionsHtml) {
+  $("modal_title").textContent = title;
+  $("modal_body").innerHTML = bodyHtml;
+  $("modal_actions").innerHTML = actionsHtml || "";
+  $("modal_mask").style.display = "flex";
+}
+function closeModal() { $("modal_mask").style.display = "none"; }
+$("modal_close").addEventListener("click", closeModal);
+$("modal_mask").addEventListener("click", closeModal);
+
+// ---------- boot ----------
+document.addEventListener("DOMContentLoaded", async () => {
+  try {
+    applyConfig(DEFAULTS);
+    if (token) {
+      $("pad_token").value = token;
+      const ok = await refreshConfig();
+      if (!ok) setStatus("Could not load /api/config — using built-in defaults. Click Connect.", false);
+    }
+    console.log("[PAD v" + PAD_VERSION + "] init OK; useCase=" + (CFG.useCase || "?") + "; token " + (token ? "present" : "absent"));
+  } catch (e) {
+    const b = $("banner");
+    b.className = "banner fatal show";
+    b.textContent = "Pad failed to initialize: " + e.message;
+    console.error("[PAD] init error:", e);
+  }
+});
+</script>
+</body>
+</html>

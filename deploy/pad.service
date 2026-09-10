@@ -1,0 +1,26 @@
+[Unit]
+# systemd USER unit for the pad kit. No sudo required:
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now pad.service
+#   systemctl --user status pad.service
+# (To keep it running after logout: sudo loginctl enable-linger $USER — the only
+#  root action, and optional.)
+Description=Email pad kit (brand-agnostic Resend pad)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# %h is the user's home directory. Adjust the directory if you installed the kit
+# somewhere else (e.g. /srv/pad-kit) — nothing else in this file is brand-specific.
+WorkingDirectory=%h/pad-kit
+ExecStart=%h/pad-kit/boot.sh
+# .env is loaded by boot.sh already; EnvironmentFile is a belt-and-braces extra
+# so systemd itself also sees the values (ignored when absent via the '-' prefix).
+EnvironmentFile=-%h/pad-kit/.env
+Restart=always
+RestartSec=3
+# Logs go to the journal: journalctl --user -u pad.service -f
+
+[Install]
+WantedBy=default.target

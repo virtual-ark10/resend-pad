@@ -1,0 +1,61 @@
+{
+  "_readme": "Copy to config.json (gitignored) and edit. Every field is OPTIONAL — omitted fields fall back to the built-in defaults for the selected useCase. See docs/CONFIG.md for the full reference. Nothing here is sent to the browser except the fields listed under 'Safe subset' in docs/CONFIG.md.",
+  "useCase": "generic",
+  "brand": {
+    "name": "Acme Labs",
+    "productName": "Acme Labs Email Pad",
+    "siteUrl": "https://acme.example",
+    "logoInitials": "AL",
+    "tagline": "Outbound + inbox · powered by Resend",
+    "accentColor": ""
+  },
+  "from": "hello@acme.example",
+  "replyTo": "hello@acme.example",
+  "signature": {
+    "html": "<p>Best,<br>Your Name<br>Acme Labs · <a href=\"https://acme.example\">acme.example</a></p>",
+    "text": "Best,\nYour Name\nAcme Labs - https://acme.example"
+  },
+  "labels": {
+    "composeTitle": "Compose",
+    "draftsTitle": "Ready to send",
+    "sentTitle": "Sent emails",
+    "receivedTitle": "Received (last 30 days)",
+    "footer": "Self-contained client — no external assets, no build step."
+  },
+  "tabs": [
+    { "id": "drafts", "label": "Drafts", "enabled": true },
+    { "id": "compose", "label": "Compose", "enabled": true },
+    { "id": "sent", "label": "Sent", "enabled": true },
+    { "id": "received", "label": "Received", "enabled": true }
+  ],
+  "templates": {
+    "intro": {
+      "label": "Intro (first contact)",
+      "subject": "{{company}} × {{product}} — quick idea",
+      "body": "<p>Hi {{first_name}},</p><p>I work on <strong>{{product}}</strong> and wanted to reach out about {{company}}.</p><p>Would you be open to a short note on what we do?</p>{{signature}}"
+    },
+    "fu1": {
+      "label": "Follow-up 1 (3–5 days)",
+      "subject": "Re: {{company}} × {{product}} — quick idea",
+      "body": "<p>Hi {{first_name}},</p><p>Just floating this back up — making sure my last note did not get buried.</p>{{signature}}"
+    }
+  },
+  "tracking": {
+    "openTracking": false,
+    "clickTracking": false,
+    "trackingSubdomain": ""
+  },
+  "limits": {
+    "ratePerMinute": 60,
+    "maxBodyBytes": 5242880,
+    "maxRecipients": 50,
+    "maxAttachmentBytes": 8388608
+  },
+  "outreach": {
+    "enabled": false,
+    "siteUrl": "",
+    "apiBase": "http://127.0.0.1:3000/api/v1",
+    "storePath": "",
+    "allowedHosts": []
+  }
+}
