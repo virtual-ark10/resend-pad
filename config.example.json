@@ -146,6 +146,15 @@
         "color": "#dc2626",
         "terminal": true
       }
-    ]
+    ],
+    "discoverFromInbox": true,
+    "ignoreSenders": [
+      "apollo.io",
+      "hunter.io",
+      "newsletterfit.com",
+      "example.com",
+      "your-own-domain.com"
+    ],
+    "_inbox_readme": "discoverFromInbox:true turns a new inbound sender into a lead (a reply is a warm lead). ignoreSenders: exact addresses or domains (and their subdomains) that must never become leads - put your tools and your own domain here."
   }
 }

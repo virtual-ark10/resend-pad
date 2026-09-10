@@ -83,6 +83,8 @@ const store = store_.open(DATA_DIR, {
   stages: STAGES,
   replyStage: LEADS_CFG.replyStage,
   wonStage: LEADS_CFG.wonStage,
+  discoverFromInbox: LEADS_CFG.discoverFromInbox,
+  ignoreSenders: LEADS_CFG.ignoreSenders,
 });
 if (!store) {
   console.error('[leads] node:sqlite is unavailable in this runtime (Node >= 22.5 needed)');

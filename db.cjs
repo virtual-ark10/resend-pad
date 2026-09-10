@@ -302,6 +302,21 @@ class Store {
     this.terminalStages = stages.filter((s) => s.terminal).map((s) => s.key);
     this.replyStageKey = opts.replyStage || this.stageOrder.find((k) => /repl/i.test(k)) || this.firstStage;
     this.wonStageKey = opts.wonStage || this.stageOrder.find((k) => /won|win|closed/i.test(k)) || null;
+    // Inbound mail can create leads (a real reply is a warm lead), but tools and
+    // your own addresses must not land in the pipeline: configurable either way.
+    this.discoverFromInbox = opts.discoverFromInbox !== false;
+    this.ignoreSenders = (Array.isArray(opts.ignoreSenders) ? opts.ignoreSenders : [])
+      .map((s) => String(s).toLowerCase().trim()).filter(Boolean);
+  }
+
+  /** Should an inbound sender land in the pipeline? */
+  shouldTrackInbound(email) {
+    if (!this.discoverFromInbox) return false;
+    const addr = firstAddress(email).toLowerCase();
+    if (!addr || !addr.includes('@')) return false;
+    const domain = addr.split('@')[1] || '';
+    return !this.ignoreSenders.some((rule) => rule === addr
+      || (rule.includes('.') && (domain === rule || domain.endsWith('.' + rule))));
   }
 
   isTerminal(stage) { return this.terminalStages.includes(stage); }
@@ -547,7 +562,9 @@ class Store {
     const id = String(msg.id || '').trim();
     if (!id) return null;
     const fromAddr = firstAddress(msg.from || (msg.headers && msg.headers.from));
-    const lead = this.upsertLead({ email: fromAddr, company: msg.company, source: 'inbound' });
+    const lead = this.shouldTrackInbound(fromAddr)
+      ? this.upsertLead({ email: fromAddr, company: msg.company, source: 'inbound' })
+      : null;
     const existing = this.get('SELECT id, deleted_at FROM replies WHERE id = ?', id);
     const vals = [lead, fromAddr || null, msg.from_name || null,
       addressList(msg.received_for || msg.to).join(', ') || null, msg.subject || null,

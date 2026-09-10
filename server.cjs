@@ -256,6 +256,8 @@ const store = require('./db.cjs').open(DATA_DIR, {
   stages: LEADS_CFG.stages || CFG.stages,
   replyStage: LEADS_CFG.replyStage,
   wonStage: LEADS_CFG.wonStage,
+  discoverFromInbox: LEADS_CFG.discoverFromInbox,
+  ignoreSenders: LEADS_CFG.ignoreSenders,
 });
 // The rules table is the backbone: an event fired here (or by the leads engine)
 // is drained on the next request and performs its next action.
