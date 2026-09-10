@@ -1,11 +1,11 @@
-# Email pad - single-service compose file.
+# Email pad + leads engine - single compose file, two services, ONE store.
 #
 # Same file runs on a laptop and on a VPS: `docker compose up -d --build`.
 # Moving hosts = copy this directory (or the image + .env + config.json + data/)
 # and run the same command.
 #
 # Deliberately published on 127.0.0.1 only. A reverse proxy on the host
-# terminates TLS and proxies to it, so the repo's add_caddy_route.py keeps
+# terminates TLS and proxies to the pad, so the repo's add_caddy_route.py keeps
 # working unchanged:
 #   python3 add_caddy_route.py --path /pad --port 3001
 services:
@@ -21,6 +21,10 @@ services:
     environment:
       PORT: "3001"
       DATA_DIR: /app/data
+      # The Leads tab proxies /api/crm/* to the engine below, injecting the
+      # pad token server-side so the browser only ever holds one credential.
+      CRM_HOST: leads
+      CRM_PORT: "3002"
 
     ports:
       # Host port is parameterised so several pads can coexist on one host:
@@ -28,8 +32,8 @@ services:
       - "127.0.0.1:${PAD_HOST_PORT:-3001}:3001"
 
     volumes:
-      # The queue and logs. A bind mount (not a named volume) so the whole pad
-      # moves to a new VPS by copying this one folder.
+      # The queue, the SQLite store and logs. A bind mount (not a named volume)
+      # so the whole pad moves to a new VPS by copying this one folder.
       - ./data:/app/data
       # Branding/templates, editable without a rebuild.
       - ./config.json:/app/config.json:ro
@@ -59,6 +63,51 @@ services:
       retries: 3
       start_period: 5s
 
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
+
+  # Leads engine (CRM). Same image, same data volume, so it reads and writes the
+  # very same pad.db - one store, not two copies to reconcile. Disable the whole
+  # thing with config.json: { "leads": { "enabled": false } }.
+  leads:
+    build: .
+    image: pad-kit:latest
+    container_name: pad-kit-leads
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      PORT: "3002"
+      DATA_DIR: /app/data
+      PAD_URL: http://pad:3001
+      SERVICE_NAME: leads
+      LEADPAD_CONFIG: /app/config.json
+    volumes:
+      - ./data:/app/data
+      - ./config.json:/app/config.json:ro
+    command: ["node", "leads/server.cjs"]
+    # The pad creates/migrates the shared store first.
+    depends_on:
+      - pad
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: 128m
+    cpus: 0.25
+    pids_limit: 96
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://127.0.0.1:3002/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
     logging:
       driver: json-file
       options:

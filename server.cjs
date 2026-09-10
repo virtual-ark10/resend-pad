@@ -251,8 +251,16 @@ const SENT_LOG = path.join(DATA_DIR, 'sent-drafts.jsonl');
 // no node:sqlite (Node < 22.5), every helper below falls back to those files so
 // the kit still works.
 // ---------------------------------------------------------------------------
-const store = require('./db.cjs').open(DATA_DIR);
-if (store) console.log(`[DB] sqlite store ready: ${store.file}`);
+const LEADS_CFG = (CFG.leads && typeof CFG.leads === 'object') ? CFG.leads : {};
+const store = require('./db.cjs').open(DATA_DIR, {
+  stages: LEADS_CFG.stages || CFG.stages,
+  replyStage: LEADS_CFG.replyStage,
+  wonStage: LEADS_CFG.wonStage,
+});
+// The rules table is the backbone: an event fired here (or by the leads engine)
+// is drained on the next request and performs its next action.
+const rules = store ? require('./hooks.cjs').buildRules(store) : null;
+if (store) console.log(`[DB] sqlite store ready: ${store.file} (stages: ${store.stageOrder.join(', ')})`);
 else console.warn('[DB] node:sqlite unavailable in this Node runtime - falling back to JSON/JSONL files');
 
 // ---------------------------------------------------------------------------
@@ -369,6 +377,7 @@ function safeConfig() {
     tabs: (Array.isArray(c.tabs) ? c.tabs : []).filter((t) => t && t.id && t.enabled !== false),
     // lets the client hide the Leads tab when no engine is wired up
     leads: { enabled: LEADS_ENABLED, port: CRM_PORT },
+    redraftReasons: LEADS_CFG.redraftReasons || ['Too long', 'Too salesy', 'Wrong angle', 'Wrong offer', 'Tone off', 'Missing detail', 'Not personalised'],
     templates: c.templates || {},
     tracking: Object.assign({}, DEFAULT_CONFIG.tracking, c.tracking || {}),
     limits: {
@@ -604,6 +613,15 @@ function handleApi(req, res, url, ip) {
     return proxyCrm(req, res, '/api' + p.slice('/api/crm'.length));
   }
 
+  // Drain the event queue: whatever fired it (a send, a reply, a redraft, the
+  // leads engine), the rule for that event runs here before the response.
+  if (store && rules) {
+    try {
+      const drained = store.processEvents(rules);
+      if (drained.processed) console.log(`[EVENTS] drained ${drained.processed}, actions: ${JSON.stringify(drained.actions)}`);
+    } catch (e) { console.warn('[EVENTS] drain failed:', e.message); }
+  }
+
   // ---- Front-end config (branding, labels, tabs, templates, use case) ----
   if (req.method === 'GET' && p === '/api/config') {
     return sendJson(res, 200, safeConfig());
@@ -829,6 +847,43 @@ function handleApi(req, res, url, ip) {
         }),
       });
     });
+  }
+
+  // ---- Redraft: send a draft back with a reason, and learn from it ----
+  // The note is stored against the draft and the lead, the draft leaves the
+  // queue (status 'redraft'), and the event below feeds the rules table.
+  if (store && req.method === 'POST' && p.startsWith('/api/drafts/') && p.endsWith('/redraft')) {
+    const draftId = decodeURIComponent(p.slice('/api/drafts/'.length, -'/redraft'.length));
+    return readBody(req, res, (body) => withStore(() => {
+      let data; try { data = JSON.parse(body || '{}'); } catch { data = {}; }
+      if (!store.getDraft(draftId)) return sendJson(res, 404, { error: 'Draft not found', id: draftId });
+      const out = store.redraft(draftId, { reason: data.reason, note: data.note });
+      if (rules) store.processEvents(rules);
+      return sendJson(res, 200, Object.assign(out, { guidance: store.redraftGuidance() }));
+    }));
+  }
+
+  // What keeps getting sent back, for whoever writes the next draft.
+  if (store && req.method === 'GET' && p === '/api/redraft-guidance') {
+    return withStore(() => sendJson(res, 200, store.redraftGuidance()));
+  }
+
+  // The backbone, visible: recent events plus anything still queued.
+  if (store && req.method === 'GET' && p === '/api/events') {
+    return withStore(() => {
+      const q = new URL(url, 'http://x');
+      sendJson(res, 200, {
+        data: store.recentEvents({
+          limit: parseInt(q.searchParams.get('limit') || '100', 10),
+          leadId: q.searchParams.get('lead') || undefined,
+        }),
+        pending: store.pendingEvents(),
+      });
+    });
+  }
+
+  if (store && req.method === 'POST' && p === '/api/events/drain') {
+    return withStore(() => sendJson(res, 200, rules ? store.processEvents(rules) : { processed: 0, actions: [] }));
   }
 
   // ---- Draft queue (review-before-send) ----

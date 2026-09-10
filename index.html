@@ -155,6 +155,8 @@
   .crm-list { flex: 1 1 520px; min-width: 0; overflow-x: auto; }
   .crm-detail { flex: 1 1 300px; max-width: 420px; border-left: 1px solid var(--line); padding-left: 16px; }
   .crm-detail .kv { clear: both; }
+  .redraft-reasons { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+  .redraft-reasons .chip { display: inline-flex; align-items: center; gap: 5px; border: 1px solid var(--line); border-radius: 999px; padding: 4px 10px; font-size: 12px; cursor: pointer; }
   .kv { margin: 8px 0; }
   .kv .k { font-size: 11px; text-transform: uppercase; letter-spacing: .5px; color: var(--muted); }
   .tl { margin-top: 10px; }
@@ -198,6 +200,11 @@
 
   <!-- ================= COMPOSE ================= -->
   <section class="panel" id="panel-compose">
+    <details id="redraft_guidance" style="margin:0 0 12px">
+      <summary style="cursor:pointer;font-weight:600;font-size:13px">What you keep sending back
+        <span style="float:right;font-weight:400;font-size:12px" onclick="event.preventDefault();loadRedraftGuidance()">refresh</span></summary>
+      <div id="redraft_guidance_body" style="margin-top:8px"></div>
+    </details>
     <div class="grid2">
       <div>
         <label for="f_from">From</label>
@@ -653,6 +660,8 @@ async function loadDrafts() {
            <div class="l-sub">to ${esc(String(m.to || ""))}${m.cc ? " · cc " + esc(String(m.cc)) : ""}${m.company ? " · " + esc(m.company) : ""}</div>
          </div>
          <div class="l-time">${fmtDate(m.created_at)}</div>
+         <span style="margin-left:6px;cursor:pointer;color:var(--accent);font-size:16px;line-height:1" title="Redraft: tell me what to change"
+               onclick="event.stopPropagation();openRedraft('${esc(String(m.id))}')">↻</span>
          <span style="margin-left:6px;cursor:pointer;color:var(--err);font-size:16px;line-height:1" title="Discard draft"
                onclick="event.stopPropagation();discardDraft('${esc(String(m.id))}')">✕</span>
        </div>`).join("");
@@ -677,6 +686,46 @@ async function openDraft(id) {
   renderAttachments();
   setStatus("Draft loaded — review, edit if needed, then press Send email. It leaves the queue when sent.", true);
 }
+function openRedraft(id) {
+  const m = draftsCache.find((x) => String(x.id) === String(id)) || {};
+  const reasons = (CFG.redraftReasons || []).map((r, i) =>
+    `<label class="chip"><input type="radio" name="redraft_reason" value="${esc(r)}"${i === 0 ? '' : ''}> ${esc(r)}</label>`).join(" ");
+  showModal("Why does this need a redraft?",
+    `<div class="meta">${esc(m.subject || "(no subject)")} \u2192 ${esc(String(m.to || ""))}</div>
+     <div class="redraft-reasons">${reasons}</div>
+     <textarea id="redraft_note" rows="4" placeholder="In your words: what is wrong with this draft, and what should it do instead?"
+       style="width:100%;margin-top:10px;font:inherit;padding:10px;border:1px solid var(--line);border-radius:8px"></textarea>
+     <div class="meta" style="margin-top:8px">Kept with the lead and fed back into future drafts.</div>`,
+    `<button class="primary" onclick="submitRedraft('${esc(String(id))}')">Send back + save note</button>
+     <button class="ghost" onclick="closeModal()">Cancel</button>`);
+}
+
+async function submitRedraft(id) {
+  const note = (document.getElementById("redraft_note") || {}).value || "";
+  const picked = document.querySelector('input[name=\"redraft_reason\"]:checked');
+  const reason = picked ? picked.value : "";
+  if (!reason && !note.trim()) { setStatus("Pick a reason or write a note first.", false); return; }
+  try {
+    await api("api/drafts/" + encodeURIComponent(id) + "/redraft", authed("POST", { reason, note: note.trim() }));
+    closeModal();
+    setStatus("Draft sent back. Noted: " + (reason || "your note") + " — it will shape the next one.", true);
+    loadDrafts();
+    loadRedraftGuidance();
+    if (typeof loadCrm === "function") loadCrm();
+  } catch (e) { setStatus("Failed to send back: " + e.message, false); }
+}
+
+async function loadRedraftGuidance() {
+  const el = document.getElementById("redraft_guidance_body");
+  if (!el) return;
+  try {
+    const g = await api("api/redraft-guidance", authed("GET"));
+    const rows = (g.recent || []).slice(0, 8).map((r) =>
+      `<div class="list-row" style="padding:4px 0"><div class="l-main"><div class="l-sub">${esc(r.reason || "no reason")}${r.note ? " — " + esc(r.note) : ""}</div></div><div class="l-time">${fmtDate(r.created_at)}</div></div>`).join("");
+    el.innerHTML = `<div class="meta">${esc(g.summary || "")}</div>` + (rows || '<div class="empty">Nothing sent back yet.</div>');
+  } catch (e) { el.innerHTML = '<div class="empty">' + esc(e.message) + "</div>"; }
+}
+
 async function discardDraft(id) {
   if (!confirm("Discard this draft? It will be removed from the queue without sending.")) return;
   try {

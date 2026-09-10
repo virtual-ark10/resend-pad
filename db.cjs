@@ -17,7 +17,7 @@ const path = require('path');
 let DatabaseSync = null;
 try { ({ DatabaseSync } = require('node:sqlite')); } catch { DatabaseSync = null; }
 
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 
 const SCHEMA = `
 -- ---------------------------------------------------------------- leads
@@ -157,12 +157,32 @@ CREATE TABLE IF NOT EXISTS events (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
   entity     TEXT NOT NULL,                    -- lead | email | reply | draft | system
   entity_id  TEXT,
-  type       TEXT NOT NULL,                    -- created | sent | received | stage_change | deleted | ...
+  type       TEXT NOT NULL,                    -- lead.created | email.sent | reply.received | ...
   payload    TEXT,                             -- JSON
   at         TEXT NOT NULL,
-  actor      TEXT
+  actor      TEXT,
+  processed_at TEXT                            -- NULL until the rules engine ran it
 );
 CREATE INDEX IF NOT EXISTS idx_events_entity ON events(entity, entity_id, at);
+CREATE INDEX IF NOT EXISTS idx_events_unprocessed ON events(processed_at, id);
+
+-- --------------------------------------------- why a draft was sent back
+CREATE TABLE IF NOT EXISTS redraft_notes (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  draft_id   TEXT,
+  lead_id    TEXT REFERENCES leads(id) ON DELETE SET NULL,
+  reason     TEXT,                             -- short chip label
+  note       TEXT,                             -- the user's own words
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_redraft_lead ON redraft_notes(lead_id, created_at);
+
+CREATE VIEW IF NOT EXISTS v_redraft_reasons AS
+SELECT COALESCE(NULLIF(reason, ''), 'unspecified') AS reason,
+       COUNT(*) AS n,
+       MAX(created_at) AS last_at
+FROM redraft_notes GROUP BY 1 ORDER BY n DESC;
+
 
 -- ------------------------------------------------------------ bookkeeping
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
@@ -215,24 +235,78 @@ function open(dataDir, opts = {}) {
   if (!DatabaseSync) return null;
   const file = path.join(dataDir, opts.file || 'pad.db');
   const db = new DatabaseSync(file);
-  db.exec('PRAGMA journal_mode = WAL');
+
+  // The pad and the leads engine share this one file, so every startup step
+  // below can collide with the other process mid-write: retry while the error
+  // says locked/busy instead of dying on boot.
+  const sleep = (ms) => { try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch (e) { /* older node */ } };
+  const withRetry = (label, fn, attempts = 60) => {
+    for (let i = 1; ; i += 1) {
+      try { return fn(); } catch (err) {
+        if (!/locked|busy/i.test(String(err && err.message)) || i >= attempts) throw err;
+        if (i === 1) console.warn(`[DB] ${label}: waiting for the other process to release the write lock`);
+        sleep(250);
+      }
+    }
+  };
+
+  db.exec('PRAGMA busy_timeout = 15000');
+  withRetry('journal_mode', () => db.exec('PRAGMA journal_mode = WAL'));
   db.exec('PRAGMA synchronous = NORMAL');
   db.exec('PRAGMA foreign_keys = ON');
-  db.exec('PRAGMA busy_timeout = 4000');
-  db.exec(SCHEMA);
-  db.prepare('INSERT INTO meta(key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING')
-    .run('schema_version', String(SCHEMA_VERSION));
+  withRetry('schema', () => {
+    db.exec(SCHEMA);
+    // Additive migrations for databases created by an earlier version.
+    const cols = db.prepare('PRAGMA table_info(events)').all().map((c) => c.name);
+    if (!cols.includes('processed_at')) db.exec('ALTER TABLE events ADD COLUMN processed_at TEXT');
+  });
+  withRetry('schema_version', () => db.prepare('INSERT INTO meta(key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING')
+    .run('schema_version', String(SCHEMA_VERSION)));
 
-  const store = new Store(db, dataDir, file);
+  const store = new Store(db, dataDir, file, opts);
   store.importLegacy();
   return store;
 }
 
+// Stage vocabulary. The pad and the leads engine share ONE store, so they must
+// agree on stage keys: pass the configured list in (config.json -> leads.stages)
+// or take the kit default. stages[0] is where a new lead lands; the reply/won
+// stages are looked up by key so the rules engine never hard-codes a name.
+const DEFAULT_STAGES = [
+  { key: 'leads', label: 'Leads', color: '#64748b' },
+  { key: 'first_email', label: 'First email', color: '#2563eb' },
+  { key: 'follow_up_1', label: 'Follow-up 1', color: '#0d9488' },
+  { key: 'follow_up_2', label: 'Follow-up 2', color: '#4f46e5' },
+  { key: 'follow_up_3', label: 'Follow-up 3', color: '#7c3aed' },
+  { key: 'follow_up_4', label: 'Follow-up 4', color: '#d97706' },
+  { key: 'replied', label: 'Replied', color: '#db2777', terminal: true },
+  { key: 'won', label: 'Won', color: '#16a34a', terminal: true },
+  { key: 'no', label: 'No', color: '#dc2626', terminal: true },
+];
+
 class Store {
-  constructor(db, dataDir, file) {
+  constructor(db, dataDir, file, opts = {}) {
     this.db = db;
     this.dataDir = dataDir;
     this.file = file;
+    const stages = Array.isArray(opts.stages) && opts.stages.length ? opts.stages : DEFAULT_STAGES;
+    this.stages = stages;
+    this.stageOrder = stages.map((s) => s.key);
+    this.firstStage = this.stageOrder[0];
+    this.terminalStages = stages.filter((s) => s.terminal).map((s) => s.key);
+    this.replyStageKey = opts.replyStage || this.stageOrder.find((k) => /repl/i.test(k)) || this.firstStage;
+    this.wonStageKey = opts.wonStage || this.stageOrder.find((k) => /won|win|closed/i.test(k)) || null;
+  }
+
+  isTerminal(stage) { return this.terminalStages.includes(stage); }
+
+  /** Next stage after a send: the pre-contact stage steps into the sequence. */
+  advanceStage(current) {
+    if (!current || this.isTerminal(current)) return current;
+    const seq = this.stageOrder.filter((k) => !this.terminalStages.includes(k));
+    const i = seq.indexOf(current);
+    if (i < 0) return seq[0] || current;
+    return seq[i + 1] || current;
   }
 
   // ------------------------------------------------------------- internals
@@ -257,7 +331,7 @@ class Store {
     const ts = nowIso();
     const existing = this.get('SELECT * FROM leads WHERE id = ?', id);
     if (!existing) {
-      const stage = 'new';
+      const stage = this.firstStage;
       this.run(`INSERT INTO leads (id, company, domain, contact_name, email, emails, website, niche, city,
                  region, country, source, stage, stage_changed_at, tags, meta, created_at, updated_at)
                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
@@ -267,7 +341,7 @@ class Store {
         tags ? JSON.stringify(tags) : null, meta ? JSON.stringify(meta) : null, ts, ts);
       this.run('INSERT INTO lead_stage_events(lead_id, from_stage, to_stage, changed_at, changed_by, note) VALUES (?,?,?,?,?,?)',
         id, null, stage, ts, 'system', 'lead created');
-      this.event('lead', id, 'created', { email: addr, company: company || null });
+      this.event('lead', id, 'lead.created', { leadId: id, email: addr, company: company || null });
       return id;
     }
     const seen = new Set(JSON.parse(existing.emails || '[]'));
@@ -289,7 +363,7 @@ class Store {
     this.run('UPDATE leads SET stage = ?, stage_changed_at = ?, updated_at = ? WHERE id = ?', stage, ts, ts, leadId);
     this.run('INSERT INTO lead_stage_events(lead_id, from_stage, to_stage, changed_at, changed_by, note) VALUES (?,?,?,?,?,?)',
       leadId, lead.stage, stage, ts, by, note);
-    this.event('lead', leadId, 'stage_change', { from: lead.stage, to: stage, by });
+    this.event('lead', leadId, 'lead.stage_change', { leadId, from_stage: lead.stage, to_stage: stage, by });
   }
 
   updateLead(id, fields) {
@@ -318,7 +392,7 @@ class Store {
       vals.push(conv ? (wasConverted && wasConverted.converted_at) || nowIso() : null);
     }
     this.run(`UPDATE leads SET ${sets.join(', ')} WHERE id = ?`, ...vals, id);
-    this.event('lead', id, 'updated', fields);
+    this.event('lead', id, 'lead.updated', { leadId: id, fields });
     return this.get('SELECT * FROM leads WHERE id = ?', id);
   }
 
@@ -388,7 +462,7 @@ class Store {
         this.run(`INSERT INTO drafts (lead_id, company, from_addr, to_addr, cc_addr, subject, reply_to,
                   in_reply_to, body_text, body_html, attachments, headers, updated_at, id, created_at, status)
                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'draft')`, ...vals, id, d.created_at || ts);
-        this.event('draft', id, 'created', { to: d.to || d.to_addr });
+        this.event('draft', id, 'draft.created', { leadId, draftId: id, to: d.to || d.to_addr, subject: d.subject || '' });
       }
     }
     const open = this.all("SELECT id FROM drafts WHERE status = 'draft'");
@@ -401,7 +475,7 @@ class Store {
     const d = this.getDraft(id);
     if (!d) return false;
     this.run("UPDATE drafts SET status='discarded', updated_at=? WHERE id=?", nowIso(), id);
-    this.event('draft', id, 'discarded', { to: d.to });
+    this.event('draft', id, 'draft.discarded', { leadId: d.lead_id, draftId: id, to: d.to });
     return true;
   }
 
@@ -434,10 +508,15 @@ class Store {
     if (lead) {
       this.run(`UPDATE leads SET last_contact_at = ?, first_contact_at = COALESCE(first_contact_at, ?),
                 updated_at = ? WHERE id = ?`, ts, ts, ts, lead);
-      const current = (this.get('SELECT stage FROM leads WHERE id = ?', lead) || {}).stage;
-      if (current === 'new') this.setStage(lead, 'contacted', { by: 'system', note: 'first send' });
     }
-    this.event('email', emailId, 'sent', { to: toList, subject, resendId: resendId || null });
+    // The stage move is deliberately NOT applied here: this event goes through the
+    // rules table (hooks.cjs), so the pad, the CRM engine and anything else that
+    // reads the queue advances a lead by the same rule instead of each writing
+    // its own. store.processEvents() runs the queue.
+    this.event('email', emailId, 'email.sent', {
+      leadId: lead, emailId, to: toList, subject, resendId: resendId || null,
+      first: lead ? (this.get('SELECT COUNT(*) AS n FROM emails WHERE lead_id = ? AND direction = \'out\'', lead).n || 0) <= 1 : false,
+    });
     return { emailId, leadId: lead };
   }
 
@@ -472,12 +551,9 @@ class Store {
       this.run(`INSERT INTO replies (lead_id, from_addr, from_name, to_addr, subject, body_text, body_html,
                   message_id, in_reply_to, received_at, raw, id, created_at, is_read)
                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,0)`, ...vals, id, nowIso());
-      this.event('reply', id, 'received', { from: fromAddr, subject: msg.subject });
+      this.event('reply', id, 'reply.received', { leadId: lead, replyId: id, from: fromAddr, subject: msg.subject });
       if (lead) {
-        const stage = (this.get('SELECT stage FROM leads WHERE id = ?', lead) || {}).stage;
-        if (stage && !['replied', 'qualified', 'won', 'lost', 'archived'].includes(stage)) {
-          this.setStage(lead, 'replied', { by: 'system', note: 'inbound reply' });
-        }
+        // Stage move happens in the rules engine, driven by this event.
         this.run('UPDATE leads SET updated_at = ? WHERE id = ?', nowIso(), lead);
       }
     } else {
@@ -498,7 +574,7 @@ class Store {
     const row = this.get('SELECT id, lead_id FROM replies WHERE id = ?', id);
     if (!row) return false;
     this.run('UPDATE replies SET deleted_at = ?, is_read = 1 WHERE id = ?', nowIso(), id);
-    this.event('reply', id, 'deleted', { leadId: row.lead_id });
+    this.event('reply', id, 'reply.deleted', { leadId: row.lead_id });
     return true;
   }
 
@@ -526,6 +602,157 @@ class Store {
       replies: one('SELECT COUNT(*) AS n FROM replies WHERE deleted_at IS NULL').n || 0,
       drafts: one("SELECT COUNT(*) AS n FROM drafts WHERE status = 'draft'").n || 0,
     };
+  }
+
+  // ------------------------------------------------- notes and the timeline
+  /** Append a note to a lead's timeline (shown in the CRM's activity list). */
+  note(leadId, text, { source = 'user', kind = 'note' } = {}) {
+    if (!leadId || !text) return null;
+    const ts = nowIso();
+    this.run('INSERT INTO events(entity, entity_id, type, payload, at, actor) VALUES (?,?,?,?,?,?)',
+      'lead', String(leadId), 'lead.note',
+      JSON.stringify({ text: String(text).slice(0, 4000), kind, source }), ts, source);
+    this.run('UPDATE leads SET updated_at = ? WHERE id = ?', ts, String(leadId));
+    return ts;
+  }
+
+  /** A lead's activity, newest first, in the shape the CRM renders. */
+  activity(leadId, limit = 200) {
+    const kindOf = {
+      'lead.created': 'created', 'lead.stage_change': 'stage', 'lead.note': 'note',
+      'email.sent': 'email_out', 'reply.received': 'email_in',
+      'draft.redraft_requested': 'redraft', 'draft.discarded': 'discarded',
+    };
+    return this.all(`SELECT id, type, payload, at AS created_at, actor AS source FROM events
+                     WHERE entity = 'lead' AND entity_id = ? ORDER BY id DESC LIMIT ?`,
+      String(leadId), limit).map((row) => {
+      let pl = {};
+      try { pl = JSON.parse(row.payload || '{}'); } catch { /* ignore */ }
+      return {
+        id: row.id,
+        kind: kindOf[row.type] || row.type,
+        type: row.type,
+        detail: pl.text || pl.note || pl.subject || pl.reason || '',
+        from: pl.from_stage !== undefined ? pl.from_stage : (pl.from || null),
+        to: pl.to_stage !== undefined ? pl.to_stage : (pl.to || null),
+        subject: pl.subject || '',
+        at: row.created_at,
+        source: row.source || pl.source || 'system',
+      };
+    });
+  }
+
+  // ------------------------------------------------- redraft feedback (learns)
+  /** Send a draft back with a reason. Kept forever; feeds redraftGuidance(). */
+  redraft(draftId, { reason = '', note: text = '' } = {}) {
+    const id = String(draftId);
+    const draft = this.getDraft(id);
+    const leadId = (draft && draft.lead_id) || null;
+    const ts = nowIso();
+    this.run('INSERT INTO redraft_notes(draft_id, lead_id, reason, note, created_at) VALUES (?,?,?,?,?)',
+      id, leadId, String(reason || '').slice(0, 120), String(text || '').slice(0, 2000), ts);
+    if (draft) this.run("UPDATE drafts SET status = 'redraft', updated_at = ? WHERE id = ?", ts, id);
+    this.event('draft', id, 'draft.redraft_requested', { leadId, draftId: id, reason, note: text });
+    if (leadId) {
+      this.note(leadId, `redraft requested${reason ? ' \u2014 ' + reason : ''}${text ? ': ' + text : ''}`,
+        { source: 'user', kind: 'redraft' });
+    }
+    return { ok: true, draft_id: id, lead_id: leadId, at: ts };
+  }
+
+  /**
+   * What keeps getting sent back, newest first. This is the learn-from-notes
+   * surface: a draft generator (any language) reads it before writing, so the
+   * same complaint does not come back twice.
+   */
+  redraftGuidance({ limit = 25 } = {}) {
+    const reasons = this.all('SELECT * FROM v_redraft_reasons LIMIT 20');
+    const recent = this.all(`SELECT draft_id, lead_id, reason, note, created_at FROM redraft_notes
+                             WHERE TRIM(COALESCE(note, \'\')) != \'\' ORDER BY id DESC LIMIT ?`, limit);
+    const total = reasons.reduce((n, r) => n + (r.n || 0), 0);
+    const top = reasons.slice(0, 3).map((r) => `${r.reason} (${r.n}x)`).join(', ');
+    return {
+      total,
+      reasons,
+      recent,
+      summary: top ? `Redraft reasons so far: ${top}.` : 'No redraft feedback yet.',
+    };
+  }
+
+  // ------------------------------------------------------- the events backbone
+  /**
+   * Drain the unprocessed queue through the rule table. Called after writes and
+   * on every /api/meta + /api/sync, so an event fired by one process triggers
+   * its next action in the other without a message bus.
+   */
+  processEvents(rules, { limit = 500 } = {}) {
+    if (!rules) return { processed: 0, actions: [] };
+    const rows = this.all(`SELECT id, entity, entity_id, type, payload, at FROM events
+                           WHERE processed_at IS NULL ORDER BY id LIMIT ?`, limit);
+    const actions = [];
+    // One short write transaction: the other process (pad/engine) may be writing
+    // the same file, and a partially applied batch would be worse than a retry.
+    let inTx = false;
+    try { this.run('BEGIN IMMEDIATE'); inTx = true; } catch (e) { /* someone else is writing; drain next time */ }
+    if (!inTx) return { processed: 0, actions: [], deferred: true };
+    for (const row of rows) {
+      let payload = {};
+      try { payload = JSON.parse(row.payload || '{}'); } catch { /* ignore */ }
+      const rule = rules[row.type];
+      try {
+        const out = rule ? rule({ event: row, payload, store: this }) : null;
+        if (out) actions.push(Object.assign({ event: row.type }, out));
+      } catch (err) {
+        console.warn(`[EVENTS] rule for ${row.type} failed:`, err.message);
+      }
+      this.run('UPDATE events SET processed_at = ? WHERE id = ?', nowIso(), row.id);
+    }
+    this.run('COMMIT');
+    return { processed: rows.length, actions };
+  }
+
+  pendingEvents(limit = 200) {
+    return this.all(`SELECT id, entity, entity_id, type, payload, at FROM events
+                     WHERE processed_at IS NULL ORDER BY id LIMIT ?`, limit);
+  }
+
+  recentEvents({ limit = 100, leadId } = {}) {
+    const where = [];
+    const vals = [];
+    if (leadId) { where.push('entity_id = ?'); vals.push(String(leadId)); }
+    return this.all(`SELECT id, entity, entity_id, type, payload, at, processed_at FROM events
+                     ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY id DESC LIMIT ?`, ...vals, limit);
+  }
+
+  // ----------------------------------------------------------- CRM read model
+  /** Leads with the counters the CRM shows, newest activity first. */
+  crmLeads({ stage } = {}) {
+    const where = ['l.deleted_at IS NULL'];
+    const vals = [];
+    if (stage) { where.push('l.stage = ?'); vals.push(stage); }
+    return this.all(`SELECT l.*,
+        (SELECT COUNT(*) FROM emails e WHERE e.lead_id = l.id AND e.direction = 'out') AS emails_sent,
+        (SELECT COUNT(*) FROM replies r WHERE r.lead_id = l.id AND r.deleted_at IS NULL) AS replies,
+        (SELECT MAX(e.sent_at) FROM emails e WHERE e.lead_id = l.id AND e.direction = 'out') AS last_out_at,
+        (SELECT MAX(r.received_at) FROM replies r WHERE r.lead_id = l.id AND r.deleted_at IS NULL) AS last_reply_at
+      FROM leads l WHERE ${where.join(' AND ')}
+      ORDER BY COALESCE(l.next_follow_up_at, l.last_contact_at, l.created_at) DESC LIMIT 1000`, ...vals);
+  }
+
+  crmCounts() {
+    const counts = {};
+    for (const key of this.stageOrder) counts[key] = 0;
+    for (const row of this.all('SELECT stage, COUNT(*) AS n FROM leads WHERE deleted_at IS NULL GROUP BY stage')) {
+      counts[row.stage] = row.n;
+    }
+    return counts;
+  }
+
+  /** A lead with its activity, in the CRM's detail shape. */
+  crmLead(id) {
+    const lead = this.get('SELECT * FROM leads WHERE id = ?', String(id));
+    if (!lead) return null;
+    return { lead, activity: this.activity(id) };
   }
 
   // ----------------------------------------------- one-time legacy import
@@ -587,4 +814,7 @@ class Store {
   }
 }
 
-module.exports = { open, Store, leadIdFor, firstAddress, addressList, SCHEMA_VERSION, available: !!DatabaseSync, slug };
+module.exports = {
+  open, Store, leadIdFor, firstAddress, addressList, slug,
+  SCHEMA_VERSION, DEFAULT_STAGES, available: !!DatabaseSync,
+};

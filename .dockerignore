@@ -17,3 +17,6 @@ deploy
 tools
 watchdog.sh
 add_caddy_route.py
+leads/data/
+leads/.env
+*.tar.gz
