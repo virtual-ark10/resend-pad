@@ -12,7 +12,7 @@ RUN apk add --no-cache tzdata
 
 WORKDIR /app
 
-COPY package.json server.cjs index.html outreach-links.cjs ./
+COPY package.json server.cjs db.cjs index.html outreach-links.cjs ./
 
 # DATA_DIR holds drafts.json, sent-drafts.jsonl and webhooks.jsonl. Created and
 # chowned here so a fresh named volume inherits the right ownership.
