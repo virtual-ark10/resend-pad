@@ -734,6 +734,8 @@ async function loadReceived() {
            <div class="l-sub">from ${esc(String(m.from || ""))}</div>
          </div>
          <div class="l-time">${fmtDate(m.created_at)}</div>
+         <span style="margin-left:6px;cursor:pointer;color:var(--err);font-size:16px;line-height:1" title="Delete reply"
+               onclick="event.stopPropagation();deleteReply('${esc(String(m.id))}')">✕</span>
        </div>`).join("");
   } catch (e) { el.innerHTML = '<div class="empty">' + esc(e.message) + "</div>"; }
 }
@@ -746,6 +748,7 @@ async function viewReceived(id) {
     const bodyHtml = m.html || esc(m.text || "(no body)");
     const actions =
       `<button class="primary" onclick="replyTo('${esc(fromAddr)}','${esc(title)}','${esc(String(m.message_id || ""))}')">Reply</button>
+       <button class="ghost" onclick="deleteReply('${esc(String(m.id))}')">Delete</button>
        <button class="ghost" onclick="closeModal()">Close</button>`;
     showModal(title,
       `<div class="meta">From: ${esc(fromRaw)}<br>Received: ${fmtDate(m.created_at)}<br>For: ${esc((m.received_for || m.to || []).join(", "))}</div>` + bodyHtml,
@@ -753,6 +756,14 @@ async function viewReceived(id) {
   } catch (e) { setStatus("Failed to load email: " + e.message, false); }
 }
 
+async function deleteReply(id) {
+  if (!confirm("Delete this reply? It is removed from the pad (the record stays in the database for history).")) return;
+  try {
+    await api("api/replies/" + encodeURIComponent(id), authed("DELETE"));
+    setStatus("Reply deleted.", true);
+    loadReceived();
+  } catch (e) { setStatus("Failed to delete: " + e.message, false); }
+}
 function replyTo(addr, subject, messageId) {
   closeModal();
   switchTab("compose");

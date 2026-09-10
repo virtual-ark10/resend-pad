@@ -1,0 +1,590 @@
+// SQLite store for the pad — leads, outbound email, replies, drafts, timeline.
+//
+// Zero npm dependencies: uses node's built-in `node:sqlite` (Node >= 22.5).
+// If that module is missing, `open()` returns null and the caller keeps using
+// the original JSON/JSONL files, so the kit still runs on older Node.
+//
+// Everything the pad knows lives in one file: data/pad.db (WAL mode).
+// Legacy files (drafts.json, sent-drafts.jsonl, webhooks.jsonl) are imported
+// once on first open and then renamed to *.imported so nothing is lost and
+// nothing is written twice.
+//
+// Brand-agnostic on purpose: no domains, no names, no campaign specifics.
+
+const fs = require('fs');
+const path = require('path');
+
+let DatabaseSync = null;
+try { ({ DatabaseSync } = require('node:sqlite')); } catch { DatabaseSync = null; }
+
+const SCHEMA_VERSION = 1;
+
+const SCHEMA = `
+-- ---------------------------------------------------------------- leads
+CREATE TABLE IF NOT EXISTS leads (
+  id                TEXT PRIMARY KEY,          -- slug of the primary email
+  company           TEXT,
+  domain            TEXT,
+  contact_name      TEXT,
+  email             TEXT,                      -- primary address
+  emails            TEXT,                      -- JSON array: every address seen
+  phone             TEXT,
+  website           TEXT,
+  niche             TEXT,                      -- trade / vertical
+  city              TEXT,
+  region            TEXT,
+  country           TEXT,
+  source            TEXT,                      -- outreach | inbound-form | import | manual
+  stage             TEXT NOT NULL DEFAULT 'new',
+  stage_changed_at  TEXT,
+  priority          INTEGER NOT NULL DEFAULT 3,-- 1 high .. 5 low
+  score             INTEGER,                   -- ranking/quality score when known
+  owner             TEXT,
+  tags              TEXT,                      -- JSON array
+  notes             TEXT,
+  meta              TEXT,                      -- JSON object: anything that does not deserve a column yet
+  converted         INTEGER NOT NULL DEFAULT 0,
+  converted_at      TEXT,
+  value_cents       INTEGER,                   -- deal value when won
+  currency          TEXT,
+  unsubscribed      INTEGER NOT NULL DEFAULT 0,
+  bounced           INTEGER NOT NULL DEFAULT 0,
+  first_contact_at  TEXT,
+  last_contact_at   TEXT,
+  next_follow_up_at TEXT,
+  created_at        TEXT NOT NULL,
+  updated_at        TEXT NOT NULL,
+  archived_at       TEXT,
+  deleted_at        TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_leads_stage    ON leads(stage);
+CREATE INDEX IF NOT EXISTS idx_leads_email    ON leads(email);
+CREATE INDEX IF NOT EXISTS idx_leads_convert  ON leads(converted);
+CREATE INDEX IF NOT EXISTS idx_leads_followup ON leads(next_follow_up_at);
+
+-- ------------------------------------------------- every stage transition
+CREATE TABLE IF NOT EXISTS lead_stage_events (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  lead_id      TEXT NOT NULL REFERENCES leads(id) ON DELETE CASCADE,
+  from_stage   TEXT,
+  to_stage     TEXT NOT NULL,
+  changed_at   TEXT NOT NULL,
+  changed_by   TEXT,
+  note         TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_stage_events_lead ON lead_stage_events(lead_id, changed_at);
+
+-- ------------------------------------------------- outbound + inbound mail
+CREATE TABLE IF NOT EXISTS emails (
+  id              TEXT PRIMARY KEY,            -- draft id or generated uuid
+  lead_id         TEXT REFERENCES leads(id) ON DELETE SET NULL,
+  direction       TEXT NOT NULL,               -- 'out' | 'in'
+  stage_at_send   TEXT,                        -- lead stage snapshotted when sent
+  thread_id       TEXT,                        -- root message id of the conversation
+  parent_email_id TEXT,                        -- the mail this one answers
+  in_reply_to     TEXT,                        -- Message-ID header
+  from_addr       TEXT,
+  to_addr         TEXT,                        -- comma separated as sent
+  cc_addr         TEXT,
+  bcc_addr        TEXT,
+  reply_to        TEXT,
+  subject         TEXT,
+  body_text       TEXT,
+  body_html       TEXT,
+  template_id     TEXT,
+  campaign        TEXT,
+  resend_id       TEXT,                        -- Resend's email id
+  status          TEXT,                        -- queued|sent|delivered|bounced|complained|failed
+  status_at       TEXT,
+  error           TEXT,
+  sent_at         TEXT,
+  created_at      TEXT NOT NULL,
+  updated_at      TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_emails_resend ON emails(resend_id) WHERE resend_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_emails_lead    ON emails(lead_id, sent_at);
+CREATE INDEX IF NOT EXISTS idx_emails_sent    ON emails(sent_at);
+
+-- ------------------------------------------------------------- replies (in)
+CREATE TABLE IF NOT EXISTS replies (
+  id            TEXT PRIMARY KEY,              -- Resend receiving id
+  lead_id       TEXT REFERENCES leads(id) ON DELETE SET NULL,
+  email_id      TEXT REFERENCES emails(id) ON DELETE SET NULL,
+  from_addr     TEXT,
+  from_name     TEXT,
+  to_addr       TEXT,
+  subject       TEXT,
+  body_text     TEXT,
+  body_html     TEXT,
+  message_id    TEXT,
+  in_reply_to   TEXT,
+  received_at   TEXT,
+  created_at    TEXT NOT NULL,
+  classification TEXT,                         -- interested|not_interested|ooo|bounce|unsubscribe|unknown
+  sentiment     TEXT,
+  is_read       INTEGER NOT NULL DEFAULT 0,
+  starred       INTEGER NOT NULL DEFAULT 0,
+  deleted_at    TEXT,                          -- the ✕ in the UI
+  raw           TEXT                           -- JSON payload, kept verbatim
+);
+CREATE INDEX IF NOT EXISTS idx_replies_lead ON replies(lead_id, received_at);
+CREATE INDEX IF NOT EXISTS idx_replies_recv ON replies(received_at);
+
+-- ------------------------------------------------------------- draft queue
+CREATE TABLE IF NOT EXISTS drafts (
+  id           TEXT PRIMARY KEY,
+  lead_id      TEXT REFERENCES leads(id) ON DELETE SET NULL,
+  company      TEXT,
+  from_addr    TEXT,
+  to_addr      TEXT,
+  cc_addr      TEXT,
+  subject      TEXT,
+  reply_to     TEXT,
+  in_reply_to  TEXT,
+  body_text    TEXT,
+  body_html    TEXT,
+  attachments  TEXT,                           -- JSON array
+  headers      TEXT,                           -- JSON object
+  status       TEXT NOT NULL DEFAULT 'draft',  -- draft | sent | discarded
+  created_at   TEXT NOT NULL,
+  updated_at   TEXT NOT NULL,
+  sent_at      TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_drafts_status ON drafts(status, created_at);
+
+-- ------------------------------------------------------ generic audit trail
+CREATE TABLE IF NOT EXISTS events (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  entity     TEXT NOT NULL,                    -- lead | email | reply | draft | system
+  entity_id  TEXT,
+  type       TEXT NOT NULL,                    -- created | sent | received | stage_change | deleted | ...
+  payload    TEXT,                             -- JSON
+  at         TEXT NOT NULL,
+  actor      TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_events_entity ON events(entity, entity_id, at);
+
+-- ------------------------------------------------------------ bookkeeping
+CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+
+-- Views the app and any SQL client can use directly.
+CREATE VIEW IF NOT EXISTS v_lead_pipeline AS
+SELECT l.id, l.company, l.email, l.stage, l.converted, l.priority,
+       l.first_contact_at, l.last_contact_at, l.next_follow_up_at,
+       (SELECT COUNT(*) FROM emails  e WHERE e.lead_id = l.id AND e.direction = 'out') AS emails_sent,
+       (SELECT COUNT(*) FROM replies r WHERE r.lead_id = l.id AND r.deleted_at IS NULL)  AS replies,
+       (SELECT MAX(r.received_at) FROM replies r WHERE r.lead_id = l.id AND r.deleted_at IS NULL) AS last_reply_at
+FROM leads l WHERE l.deleted_at IS NULL;
+
+CREATE VIEW IF NOT EXISTS v_lead_timeline AS
+SELECT lead_id, at, kind, detail FROM (
+  SELECT lead_id, sent_at AS at, 'email_sent' AS kind, subject AS detail FROM emails WHERE sent_at IS NOT NULL
+  UNION ALL
+  SELECT lead_id, received_at, 'reply_received', subject FROM replies WHERE deleted_at IS NULL
+  UNION ALL
+  SELECT lead_id, changed_at, 'stage_change', from_stage || ' -> ' || to_stage FROM lead_stage_events
+) ORDER BY at DESC;
+`;
+
+const nowIso = () => new Date().toISOString();
+
+function slug(input) {
+  return String(input || 'unknown').trim().toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'unknown';
+}
+
+function firstAddress(value) {
+  if (Array.isArray(value)) value = value[0] || '';
+  return String(value || '').split(',').map((s) => s.trim()).filter(Boolean)[0] || '';
+}
+
+function addressList(value) {
+  if (Array.isArray(value)) return value.map((s) => String(s).trim()).filter(Boolean);
+  return String(value || '').split(',').map((s) => s.trim()).filter(Boolean);
+}
+
+function leadIdFor(email) {
+  return 'lead-' + slug(firstAddress(email));
+}
+
+/**
+ * Open (creating if needed) the SQLite store.
+ * @returns {null|object} null when node:sqlite is unavailable.
+ */
+function open(dataDir, opts = {}) {
+  if (!DatabaseSync) return null;
+  const file = path.join(dataDir, opts.file || 'pad.db');
+  const db = new DatabaseSync(file);
+  db.exec('PRAGMA journal_mode = WAL');
+  db.exec('PRAGMA synchronous = NORMAL');
+  db.exec('PRAGMA foreign_keys = ON');
+  db.exec('PRAGMA busy_timeout = 4000');
+  db.exec(SCHEMA);
+  db.prepare('INSERT INTO meta(key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING')
+    .run('schema_version', String(SCHEMA_VERSION));
+
+  const store = new Store(db, dataDir, file);
+  store.importLegacy();
+  return store;
+}
+
+class Store {
+  constructor(db, dataDir, file) {
+    this.db = db;
+    this.dataDir = dataDir;
+    this.file = file;
+  }
+
+  // ------------------------------------------------------------- internals
+  run(sql, ...params) { return this.db.prepare(sql).run(...params); }
+
+  get(sql, ...params) { return this.db.prepare(sql).get(...params); }
+
+  all(sql, ...params) { return this.db.prepare(sql).all(...params); }
+
+  event(entity, entityId, type, payload) {
+    try {
+      this.run('INSERT INTO events(entity, entity_id, type, payload, at) VALUES (?,?,?,?,?)',
+        entity, entityId == null ? null : String(entityId), type, payload ? JSON.stringify(payload) : null, nowIso());
+    } catch (err) { console.warn('[DB] event log failed:', err.message); }
+  }
+
+  /** Create the lead if it is new, otherwise fill in blanks and touch it. */
+  upsertLead({ email, company, website, niche, city, region, country, source, name, tags, meta }) {
+    const addr = firstAddress(email);
+    if (!addr) return null;
+    const id = leadIdFor(addr);
+    const ts = nowIso();
+    const existing = this.get('SELECT * FROM leads WHERE id = ?', id);
+    if (!existing) {
+      const stage = 'new';
+      this.run(`INSERT INTO leads (id, company, domain, contact_name, email, emails, website, niche, city,
+                 region, country, source, stage, stage_changed_at, tags, meta, created_at, updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        id, company || null, website ? slug(String(website).replace(/^https?:\/\//, '').split('/')[0]) : null,
+        name || null, addr, JSON.stringify([addr]), website || null, niche || null, city || null,
+        region || null, country || null, source || 'unknown', stage, ts,
+        tags ? JSON.stringify(tags) : null, meta ? JSON.stringify(meta) : null, ts, ts);
+      this.run('INSERT INTO lead_stage_events(lead_id, from_stage, to_stage, changed_at, changed_by, note) VALUES (?,?,?,?,?,?)',
+        id, null, stage, ts, 'system', 'lead created');
+      this.event('lead', id, 'created', { email: addr, company: company || null });
+      return id;
+    }
+    const seen = new Set(JSON.parse(existing.emails || '[]'));
+    seen.add(addr);
+    this.run(`UPDATE leads SET company = COALESCE(NULLIF(?, ''), company),
+                 website = COALESCE(NULLIF(?, ''), website),
+                 niche = COALESCE(NULLIF(?, ''), niche),
+                 city = COALESCE(NULLIF(?, ''), city),
+                 emails = ?, updated_at = ? WHERE id = ?`,
+      company || '', website || '', niche || '', city || '', JSON.stringify([...seen]), ts, id);
+    return id;
+  }
+
+  setStage(leadId, stage, { by = 'user', note = null } = {}) {
+    if (!leadId || !stage) return;
+    const lead = this.get('SELECT stage FROM leads WHERE id = ?', leadId);
+    if (!lead || lead.stage === stage) return;
+    const ts = nowIso();
+    this.run('UPDATE leads SET stage = ?, stage_changed_at = ?, updated_at = ? WHERE id = ?', stage, ts, ts, leadId);
+    this.run('INSERT INTO lead_stage_events(lead_id, from_stage, to_stage, changed_at, changed_by, note) VALUES (?,?,?,?,?,?)',
+      leadId, lead.stage, stage, ts, by, note);
+    this.event('lead', leadId, 'stage_change', { from: lead.stage, to: stage, by });
+  }
+
+  updateLead(id, fields) {
+    const allowed = ['company', 'contact_name', 'email', 'phone', 'website', 'niche', 'city', 'region',
+      'country', 'source', 'stage', 'priority', 'score', 'owner', 'tags', 'notes', 'meta', 'converted',
+      'converted_at', 'value_cents', 'currency', 'unsubscribed', 'bounced', 'next_follow_up_at', 'archived_at'];
+    const sets = [];
+    const vals = [];
+    for (const [k, vRaw] of Object.entries(fields || {})) {
+      if (!allowed.includes(k)) continue;
+      // node:sqlite binds strings/numbers/null only: coerce the rest here so a
+      // JSON body with true/false or a nested object cannot throw a TypeError.
+      let v = vRaw;
+      if (typeof v === 'boolean') v = v ? 1 : 0;
+      else if (v === undefined) v = null;
+      else if (typeof v === 'object' && v !== null) v = JSON.stringify(v);
+      sets.push(`${k} = ?`);
+      vals.push(v);
+    }
+    if (!sets.length) return this.get('SELECT * FROM leads WHERE id = ?', id);
+    const wasConverted = this.get('SELECT converted, converted_at FROM leads WHERE id = ?', id);
+    sets.push('updated_at = ?'); vals.push(nowIso());
+    if (Object.prototype.hasOwnProperty.call(fields, 'converted')) {
+      const conv = fields.converted ? 1 : 0;
+      sets.push('converted_at = ?');
+      vals.push(conv ? (wasConverted && wasConverted.converted_at) || nowIso() : null);
+    }
+    this.run(`UPDATE leads SET ${sets.join(', ')} WHERE id = ?`, ...vals, id);
+    this.event('lead', id, 'updated', fields);
+    return this.get('SELECT * FROM leads WHERE id = ?', id);
+  }
+
+  listLeads({ stage, converted, limit = 500 } = {}) {
+    // v_lead_pipeline already excludes soft-deleted leads.
+    const where = [];
+    const vals = [];
+    if (stage) { where.push('stage = ?'); vals.push(stage); }
+    if (converted !== undefined && converted !== null) { where.push('converted = ?'); vals.push(converted ? 1 : 0); }
+    const sql = `SELECT * FROM v_lead_pipeline ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+                 ORDER BY COALESCE(last_reply_at, last_contact_at, first_contact_at) DESC LIMIT ?`;
+    return this.all(sql, ...vals, limit);
+  }
+
+  leadDetail(id) {
+    const lead = this.get('SELECT * FROM leads WHERE id = ?', id);
+    if (!lead) return null;
+    return {
+      lead,
+      stage_events: this.all('SELECT * FROM lead_stage_events WHERE lead_id = ? ORDER BY changed_at', id),
+      emails: this.all('SELECT id, direction, subject, status, sent_at, stage_at_send, resend_id FROM emails WHERE lead_id = ? ORDER BY COALESCE(sent_at, created_at)', id),
+      replies: this.all('SELECT id, subject, from_addr, received_at, classification, deleted_at FROM replies WHERE lead_id = ? ORDER BY received_at', id),
+      timeline: this.all('SELECT * FROM v_lead_timeline WHERE lead_id = ? LIMIT 200', id),
+    };
+  }
+
+  stageCounts() {
+    return this.all('SELECT stage, COUNT(*) AS n, SUM(converted) AS converted FROM leads WHERE deleted_at IS NULL GROUP BY stage ORDER BY n DESC');
+  }
+
+  // ------------------------------------------------------------ draft queue
+  listDrafts() {
+    return this.all(`SELECT id, company, from_addr AS "from", to_addr AS "to", cc_addr AS cc, subject,
+                            reply_to, in_reply_to, body_text AS text, body_html AS html, attachments,
+                            headers, created_at, updated_at, status, lead_id
+                     FROM drafts WHERE status = 'draft' ORDER BY created_at`);
+  }
+
+  getDraft(id) {
+    return this.get(`SELECT id, company, from_addr AS "from", to_addr AS "to", cc_addr AS cc, subject,
+                            reply_to, in_reply_to, body_text AS text, body_html AS html, attachments,
+                            headers, created_at, updated_at, status, lead_id
+                     FROM drafts WHERE id = ?`, id) || null;
+  }
+
+  replaceDrafts(list) {
+    // The pad rewrites the whole queue; keep rows the caller still has and mark
+    // anything else as discarded rather than deleting history.
+    const keep = new Set();
+    for (const d of Array.isArray(list) ? list : []) {
+      const id = String(d.id || '').trim();
+      if (!id) continue;
+      keep.add(id);
+      const leadId = this.upsertLead({ email: d.to || d.to_addr, company: d.company, source: 'outreach' });
+      const ts = nowIso();
+      const exists = this.get('SELECT id, status FROM drafts WHERE id = ?', id);
+      const vals = [leadId, d.company || null, d.from || d.from_addr || null, d.to || d.to_addr || null,
+        d.cc || d.cc_addr || null, d.subject || null, d.reply_to || null, d.in_reply_to || null,
+        d.text || d.body_text || null, d.html || d.body_html || null,
+        d.attachments ? JSON.stringify(d.attachments) : null,
+        d.headers ? JSON.stringify(d.headers) : null, ts];
+      if (exists) {
+        this.run(`UPDATE drafts SET lead_id=?, company=?, from_addr=?, to_addr=?, cc_addr=?, subject=?,
+                  reply_to=?, in_reply_to=?, body_text=?, body_html=?, attachments=?, headers=?, updated_at=?,
+                  status='draft' WHERE id=?`, ...vals, id);
+      } else {
+        this.run(`INSERT INTO drafts (lead_id, company, from_addr, to_addr, cc_addr, subject, reply_to,
+                  in_reply_to, body_text, body_html, attachments, headers, updated_at, id, created_at, status)
+                  VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'draft')`, ...vals, id, d.created_at || ts);
+        this.event('draft', id, 'created', { to: d.to || d.to_addr });
+      }
+    }
+    const open = this.all("SELECT id FROM drafts WHERE status = 'draft'");
+    for (const row of open) {
+      if (!keep.has(row.id)) this.run("UPDATE drafts SET status='discarded', updated_at=? WHERE id=?", nowIso(), row.id);
+    }
+  }
+
+  deleteDraft(id) {
+    const d = this.getDraft(id);
+    if (!d) return false;
+    this.run("UPDATE drafts SET status='discarded', updated_at=? WHERE id=?", nowIso(), id);
+    this.event('draft', id, 'discarded', { to: d.to });
+    return true;
+  }
+
+  markDraftSent(id, { bodyText, bodyHtml } = {}) {
+    this.run("UPDATE drafts SET status='sent', sent_at=?, updated_at=? WHERE id=?", nowIso(), nowIso(), id);
+    if (bodyText || bodyHtml) {
+      this.run('UPDATE drafts SET body_text = COALESCE(?, body_text), body_html = COALESCE(?, body_html) WHERE id = ?',
+        bodyText || null, bodyHtml || null, id);
+    }
+  }
+
+  // ------------------------------------------------------- outbound emails
+  /** Record one outbound send, linked to its lead and the stage at send time. */
+  recordSend({ id, resendId, leadId, from, to, cc, replyTo, inReplyTo, subject, text, html, templateId, campaign, status, threadId, parentEmailId }) {
+    const toList = addressList(to);
+    const lead = leadId || this.upsertLead({ email: toList[0], source: 'outreach' });
+    const stage = lead ? (this.get('SELECT stage FROM leads WHERE id = ?', lead) || {}).stage : null;
+    const ts = nowIso();
+    const emailId = String(id || resendId || ('mail-' + Date.now()));
+    this.run(`INSERT INTO emails (id, lead_id, direction, stage_at_send, thread_id, parent_email_id, in_reply_to,
+                from_addr, to_addr, cc_addr, reply_to, subject, body_text, body_html, template_id, campaign,
+                resend_id, status, status_at, sent_at, created_at, updated_at)
+              VALUES (?,?, 'out', ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+              ON CONFLICT(id) DO UPDATE SET resend_id=excluded.resend_id, status=excluded.status,
+                status_at=excluded.status_at, sent_at=excluded.sent_at, updated_at=excluded.updated_at`,
+      emailId, lead, stage, threadId || emailId, parentEmailId || null, inReplyTo || null,
+      from || null, toList.join(', '), addressList(cc).join(', ') || null, firstAddress(replyTo) || null,
+      subject || null, text || null, html || null, templateId || null, campaign || null,
+      resendId || null, status || 'sent', ts, ts, ts, ts);
+    if (lead) {
+      this.run(`UPDATE leads SET last_contact_at = ?, first_contact_at = COALESCE(first_contact_at, ?),
+                updated_at = ? WHERE id = ?`, ts, ts, ts, lead);
+      const current = (this.get('SELECT stage FROM leads WHERE id = ?', lead) || {}).stage;
+      if (current === 'new') this.setStage(lead, 'contacted', { by: 'system', note: 'first send' });
+    }
+    this.event('email', emailId, 'sent', { to: toList, subject, resendId: resendId || null });
+    return { emailId, leadId: lead };
+  }
+
+  updateEmailStatus(resendId, status) {
+    if (!resendId) return;
+    this.run('UPDATE emails SET status = ?, status_at = ?, updated_at = ? WHERE resend_id = ?',
+      status, nowIso(), nowIso(), resendId);
+  }
+
+  listEmails({ leadId, limit = 200 } = {}) {
+    const where = ["direction = 'out'"];
+    const vals = [];
+    if (leadId) { where.push('lead_id = ?'); vals.push(leadId); }
+    return this.all(`SELECT id, lead_id, subject, to_addr AS "to", from_addr AS "from", status, sent_at,
+                            stage_at_send, resend_id, body_text AS text, body_html AS html
+                     FROM emails WHERE ${where.join(' AND ')} ORDER BY sent_at DESC LIMIT ?`, ...vals, limit);
+  }
+
+  // ---------------------------------------------------------------- replies
+  /** Upsert one inbound message; never overwrites a soft delete with a new one. */
+  saveReply(msg) {
+    const id = String(msg.id || '').trim();
+    if (!id) return null;
+    const fromAddr = firstAddress(msg.from || (msg.headers && msg.headers.from));
+    const lead = this.upsertLead({ email: fromAddr, company: msg.company, source: 'inbound' });
+    const existing = this.get('SELECT id, deleted_at FROM replies WHERE id = ?', id);
+    const vals = [lead, fromAddr || null, msg.from_name || null,
+      addressList(msg.received_for || msg.to).join(', ') || null, msg.subject || null,
+      msg.text || null, msg.html || null, msg.message_id || null, msg.in_reply_to || null,
+      msg.created_at || nowIso(), JSON.stringify(msg)];
+    if (!existing) {
+      this.run(`INSERT INTO replies (lead_id, from_addr, from_name, to_addr, subject, body_text, body_html,
+                  message_id, in_reply_to, received_at, raw, id, created_at, is_read)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,0)`, ...vals, id, nowIso());
+      this.event('reply', id, 'received', { from: fromAddr, subject: msg.subject });
+      if (lead) {
+        const stage = (this.get('SELECT stage FROM leads WHERE id = ?', lead) || {}).stage;
+        if (stage && !['replied', 'qualified', 'won', 'lost', 'archived'].includes(stage)) {
+          this.setStage(lead, 'replied', { by: 'system', note: 'inbound reply' });
+        }
+        this.run('UPDATE leads SET updated_at = ? WHERE id = ?', nowIso(), lead);
+      }
+    } else {
+      // keep classification/stage/deleted state, refresh the body only
+      this.run(`UPDATE replies SET lead_id=COALESCE(?, lead_id), from_addr=?, from_name=?, to_addr=?, subject=?,
+                body_text=?, body_html=?, message_id=?, in_reply_to=?, received_at=?, raw=? WHERE id=?`,
+        ...vals.slice(0, 11), id);
+    }
+    return { id, leadId: lead, deleted: !!(existing && existing.deleted_at) };
+  }
+
+  /** Ids deleted through the UI, so a live Resend listing can hide them. */
+  deletedReplyIds() {
+    return this.all('SELECT id FROM replies WHERE deleted_at IS NOT NULL').map((r) => r.id);
+  }
+
+  deleteReply(id) {
+    const row = this.get('SELECT id, lead_id FROM replies WHERE id = ?', id);
+    if (!row) return false;
+    this.run('UPDATE replies SET deleted_at = ?, is_read = 1 WHERE id = ?', nowIso(), id);
+    this.event('reply', id, 'deleted', { leadId: row.lead_id });
+    return true;
+  }
+
+  listReplies({ leadId, includeDeleted = false, limit = 200 } = {}) {
+    const where = [];
+    const vals = [];
+    if (!includeDeleted) where.push('deleted_at IS NULL');
+    if (leadId) { where.push('lead_id = ?'); vals.push(leadId); }
+    return this.all(`SELECT id, lead_id, from_addr, subject, received_at, classification, sentiment,
+                            is_read, deleted_at FROM replies
+                     ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+                     ORDER BY received_at DESC LIMIT ?`, ...vals, limit);
+  }
+
+  stats() {
+    const one = (sql) => this.get(sql) || {};
+    return {
+      backend: 'sqlite',
+      file: this.file,
+      schema_version: Number((this.get("SELECT value FROM meta WHERE key = 'schema_version'") || {}).value || 0),
+      leads: one('SELECT COUNT(*) AS n FROM leads WHERE deleted_at IS NULL').n || 0,
+      converted: one('SELECT COUNT(*) AS n FROM leads WHERE converted = 1 AND deleted_at IS NULL').n || 0,
+      stages: this.stageCounts(),
+      emails_sent: one("SELECT COUNT(*) AS n FROM emails WHERE direction = 'out'").n || 0,
+      replies: one('SELECT COUNT(*) AS n FROM replies WHERE deleted_at IS NULL').n || 0,
+      drafts: one("SELECT COUNT(*) AS n FROM drafts WHERE status = 'draft'").n || 0,
+    };
+  }
+
+  // ----------------------------------------------- one-time legacy import
+  importLegacy() {
+    const done = this.get("SELECT value FROM meta WHERE key = 'legacy_imported'");
+    if (done) return;
+    const stamp = nowIso();
+    let imported = { drafts: 0, sent: 0, webhooks: 0 };
+
+    const draftsFile = path.join(this.dataDir, 'drafts.json');
+    if (fs.existsSync(draftsFile)) {
+      try {
+        const arr = JSON.parse(fs.readFileSync(draftsFile, 'utf8'));
+        if (Array.isArray(arr)) { this.replaceDrafts(arr); imported.drafts = arr.length; }
+        fs.renameSync(draftsFile, draftsFile + '.imported');
+      } catch (err) { console.warn('[DB] drafts import skipped:', err.message); }
+    }
+
+    const sentFile = path.join(this.dataDir, 'sent-drafts.jsonl');
+    if (fs.existsSync(sentFile)) {
+      try {
+        const lines = fs.readFileSync(sentFile, 'utf8').split('\n').filter(Boolean);
+        for (const line of lines) {
+          let e; try { e = JSON.parse(line); } catch { continue; }
+          this.recordSend({
+            id: e.id || e.resend_id, resendId: e.resend_id, to: e.to, subject: e.subject,
+            status: 'sent', company: e.company,
+          });
+          if (e.sent_at) {
+            this.run('UPDATE emails SET sent_at = ?, created_at = ?, status_at = ? WHERE id = ?',
+              e.sent_at, e.sent_at, e.sent_at, String(e.id || e.resend_id));
+          }
+        }
+        imported.sent = lines.length;
+        fs.renameSync(sentFile, sentFile + '.imported');
+      } catch (err) { console.warn('[DB] sent import skipped:', err.message); }
+    }
+
+    const hookFile = path.join(this.dataDir, 'webhooks.jsonl');
+    if (fs.existsSync(hookFile)) {
+      try {
+        const lines = fs.readFileSync(hookFile, 'utf8').split('\n').filter(Boolean);
+        for (const line of lines) {
+          let ev; try { ev = JSON.parse(line); } catch { continue; }
+          const d = (ev.event && (ev.event.data || ev.event)) || {};
+          const type = (ev.event && ev.event.type) || 'webhook';
+          const emailId = d.email_id || d.id || null;
+          if (emailId) this.updateEmailStatus(emailId, String(type).split('.').pop());
+          this.event('system', emailId, 'webhook', { type, received_at: ev.received_at });
+        }
+        imported.webhooks = lines.length;
+        fs.renameSync(hookFile, hookFile + '.imported');
+      } catch (err) { console.warn('[DB] webhook import skipped:', err.message); }
+    }
+
+    this.run('INSERT INTO meta(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value',
+      'legacy_imported', stamp);
+    console.log(`[DB] imported legacy files: ${imported.drafts} drafts, ${imported.sent} sent, ${imported.webhooks} webhook events`);
+  }
+}
+
+module.exports = { open, Store, leadIdFor, firstAddress, addressList, SCHEMA_VERSION, available: !!DatabaseSync, slug };

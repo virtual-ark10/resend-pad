@@ -243,10 +243,24 @@ const DRAFTS_FILE = path.join(DATA_DIR, 'drafts.json');
 const SENT_LOG = path.join(DATA_DIR, 'sent-drafts.jsonl');
 
 // ---------------------------------------------------------------------------
+// SQLite store (node:sqlite, no npm dependencies).
+//
+// Leads, outbound mail, replies, drafts and the audit trail live in one file:
+// DATA_DIR/pad.db. The legacy JSON/JSONL files above are imported once on first
+// boot (and renamed *.imported) when the store is available; if the runtime has
+// no node:sqlite (Node < 22.5), every helper below falls back to those files so
+// the kit still works.
+// ---------------------------------------------------------------------------
+const store = require('./db.cjs').open(DATA_DIR);
+if (store) console.log(`[DB] sqlite store ready: ${store.file}`);
+else console.warn('[DB] node:sqlite unavailable in this Node runtime - falling back to JSON/JSONL files');
+
+// ---------------------------------------------------------------------------
 // Draft store (review-before-send queue) — re-read on every request
 // ---------------------------------------------------------------------------
 
 function readDrafts() {
+  if (store) { try { return store.listDrafts(); } catch (e) { console.warn('[DB] readDrafts:', e.message); } }
   try {
     const raw = fs.readFileSync(DRAFTS_FILE, 'utf8');
     const arr = JSON.parse(raw);
@@ -254,9 +268,32 @@ function readDrafts() {
   } catch { return []; }
 }
 function writeDrafts(arr) {
+  if (store) { try { return store.replaceDrafts(arr); } catch (e) { console.warn('[DB] writeDrafts:', e.message); } }
   fs.writeFileSync(DRAFTS_FILE, JSON.stringify(arr, null, 2) + '\n');
 }
+// Every outbound send is recorded against its lead, with the body and the lead's
+// stage snapshotted at send time, so history survives a stage change later.
 function appendSentDraft(entry) {
+  if (store) {
+    try {
+      store.recordSend({
+        id: entry.id,
+        resendId: entry.resend_id,
+        to: entry.to,
+        cc: entry.cc,
+        from: entry.from,
+        replyTo: entry.reply_to,
+        inReplyTo: entry.in_reply_to,
+        subject: entry.subject,
+        text: entry.text,
+        html: entry.html,
+        templateId: entry.template_id,
+        campaign: entry.campaign,
+        status: entry.status || 'sent',
+      });
+      return Promise.resolve(true);
+    } catch (e) { console.warn('[DB] recordSend:', e.message); }
+  }
   return new Promise((resolve) => {
     fs.appendFile(SENT_LOG, JSON.stringify(entry) + '\n', (err) => resolve(!err));
   });
@@ -537,6 +574,13 @@ function handleApi(req, res, url, ip) {
       }
       let event;
       try { event = JSON.parse(rawBody); } catch { return sendJson(res, 400, { error: 'bad json' }); }
+      if (store) {
+        try {
+          const d = event.data || {};
+          if (d.email_id) store.updateEmailStatus(d.email_id, String(event.type || '').split('.').pop());
+          store.event('system', d.email_id || d.id || null, 'webhook', { type: event.type || 'unknown' });
+        } catch (e) { console.warn('[DB] webhook:', e.message); }
+      }
       appendWebhookLog({ received_at: new Date().toISOString(), event }).then((written) => {
         console.log(`[WEBHOOK] ${event.type || 'unknown'} archived (${written ? 'OK' : 'WRITE FAILED'})`);
         if (!written) return sendJson(res, 500, { error: 'archive write failed' });
@@ -573,7 +617,27 @@ function handleApi(req, res, url, ip) {
       const leadId = 'manual-' + (String((Array.isArray(data.to) ? data.to[0] : data.to) || 'unknown').trim().toLowerCase().replace(/[^a-z0-9]+/g, '-') || 'unknown');
       const doSend = () => resendRequest('POST', '/emails', JSON.stringify(data), (err, status, rbody) => {
         if (err) return sendJson(res, 502, { error: 'Failed to contact Resend', details: err.message });
-        if (status === 200 || status === 201) console.log('[SEND] Email accepted, id:', String(rbody).slice(0, 200));
+        if (status === 200 || status === 201) {
+          const accepted = safeJson(rbody) || {};
+          console.log('[SEND] Email accepted, id:', String(rbody).slice(0, 200));
+          if (store) {
+            try {
+              store.recordSend({
+                id: accepted.id || undefined,
+                resendId: accepted.id,
+                from: data.from,
+                to: data.to,
+                cc: data.cc,
+                replyTo: data.reply_to,
+                inReplyTo: data.headers && data.headers['In-Reply-To'],
+                subject: data.subject,
+                text: data.text,
+                html: data.html,
+                status: 'sent',
+              });
+            } catch (e) { console.warn('[DB] recordSend (manual):', e.message); }
+          }
+        }
         sendJson(res, status, safeJson(rbody));
       });
       const rawText = data.text || '';
@@ -626,7 +690,17 @@ function handleApi(req, res, url, ip) {
     if (before) rp += `&before=${encodeURIComponent(before)}`;
     return resendRequest('GET', rp, null, (err, status, rbody) => {
       if (err) return sendJson(res, 502, { error: 'Failed to contact Resend', details: err.message });
-      sendJson(res, status, safeJson(rbody));
+      const payload = safeJson(rbody);
+      if (store && payload && Array.isArray(payload.data)) {
+        // Persist what we just fetched (permanent record + lead linkage) and
+        // hide anything the user deleted with the ✕ in the UI.
+        const hidden = new Set(store.deletedReplyIds());
+        for (const msg of payload.data) {
+          try { store.saveReply(msg); } catch (e) { console.warn('[DB] saveReply:', e.message); }
+        }
+        payload.data = payload.data.filter((msg) => !hidden.has(String(msg.id)));
+      }
+      sendJson(res, status, payload);
     });
   }
 
@@ -647,6 +721,113 @@ function handleApi(req, res, url, ip) {
         try { return JSON.parse(l); } catch { return null; }
       }).filter(Boolean).reverse();
       return sendJson(res, 200, { data: lines });
+    });
+  }
+
+  // ---- Replies, leads and the audit trail (SQLite only) ----
+  // Every handler below is wrapped: a throw inside a readBody callback would
+  // otherwise become an unhandled rejection and take the pad down with it.
+  const storeFail = (e) => {
+    console.warn('[DB] request failed:', e.message);
+    return sendJson(res, 500, { error: 'store error', details: e.message });
+  };
+  const withStore = (fn) => {
+    try { return fn(); } catch (e) { return storeFail(e); }
+  };
+
+  // The ✕ in the UI calls DELETE /api/replies/:id: the message is soft-deleted,
+  // stays in the database for history, and is filtered out of /api/received.
+  if (store && p === '/api/replies' && req.method === 'GET') {
+    return withStore(() => {
+      const q = new URL(url, 'http://x');
+      sendJson(res, 200, {
+        data: store.listReplies({
+          leadId: q.searchParams.get('lead') || undefined,
+          includeDeleted: q.searchParams.get('include_deleted') === '1',
+          limit: parseInt(q.searchParams.get('limit') || '200', 10),
+        }),
+      });
+    });
+  }
+
+  if (store && req.method === 'DELETE' && p.startsWith('/api/replies/')) {
+    return withStore(() => {
+      const id = decodeURIComponent(p.slice('/api/replies/'.length));
+      const ok = store.deleteReply(id);
+      sendJson(res, ok ? 200 : 404, ok ? { ok: true, id } : { error: 'Reply not found', id });
+    });
+  }
+
+  if (store && req.method === 'GET' && p.startsWith('/api/replies/')) {
+    return withStore(() => {
+      const id = decodeURIComponent(p.slice('/api/replies/'.length));
+      const row = store.get('SELECT * FROM replies WHERE id = ?', id);
+      if (!row) return sendJson(res, 404, { error: 'Reply not found', id });
+      return sendJson(res, 200, row);
+    });
+  }
+
+  if (store && p === '/api/leads' && req.method === 'GET') {
+    return withStore(() => {
+      const q = new URL(url, 'http://x');
+      const converted = q.searchParams.get('converted');
+      sendJson(res, 200, {
+        data: store.listLeads({
+          stage: q.searchParams.get('stage') || undefined,
+          converted: converted === null ? undefined : converted === '1' || converted === 'true',
+          limit: parseInt(q.searchParams.get('limit') || '500', 10),
+        }),
+      });
+    });
+  }
+
+  if (store && p === '/api/leads' && req.method === 'POST') {
+    return readBody(req, res, (body) => withStore(() => {
+      let data; try { data = JSON.parse(body); } catch { return sendJson(res, 400, { error: 'Invalid JSON' }); }
+      const id = store.upsertLead(data);
+      if (!id) return sendJson(res, 400, { error: 'an email address is required' });
+      const rest = JSON.parse(JSON.stringify(data));
+      delete rest.stage;
+      if (Object.keys(rest).length) store.updateLead(id, rest);
+      if (data.stage) store.setStage(id, String(data.stage), { by: 'user', note: data.note || null });
+      return sendJson(res, 200, store.leadDetail(id));
+    }));
+  }
+
+  if (store && p.startsWith('/api/leads/') && (req.method === 'GET' || req.method === 'PATCH' || req.method === 'POST')) {
+    const id = decodeURIComponent(p.slice('/api/leads/'.length));
+    if (req.method === 'GET') {
+      return withStore(() => {
+        const detail = store.leadDetail(id);
+        return detail ? sendJson(res, 200, detail) : sendJson(res, 404, { error: 'Lead not found', id });
+      });
+    }
+    return readBody(req, res, (body) => withStore(() => {
+      let data; try { data = JSON.parse(body); } catch { return sendJson(res, 400, { error: 'Invalid JSON' }); }
+      if (!store.get('SELECT id FROM leads WHERE id = ?', id)) return sendJson(res, 404, { error: 'Lead not found', id });
+      const stage = data.stage;
+      const rest = JSON.parse(JSON.stringify(data));
+      delete rest.stage;
+      delete rest.note;
+      if (Object.keys(rest).length) store.updateLead(id, rest);
+      if (stage) store.setStage(id, String(stage), { by: 'user', note: data.note || null });
+      return sendJson(res, 200, { lead: store.get('SELECT * FROM leads WHERE id = ?', id), detail: store.leadDetail(id) });
+    }));
+  }
+
+  if (store && p === '/api/stats' && req.method === 'GET') {
+    return withStore(() => sendJson(res, 200, store.stats()));
+  }
+
+  if (store && p === '/api/emails' && req.method === 'GET') {
+    return withStore(() => {
+      const q = new URL(url, 'http://x');
+      sendJson(res, 200, {
+        data: store.listEmails({
+          leadId: q.searchParams.get('lead') || undefined,
+          limit: parseInt(q.searchParams.get('limit') || '200', 10),
+        }),
+      });
     });
   }
 
@@ -696,7 +877,21 @@ function handleApi(req, res, url, ip) {
         const doSendDraft = () => resendRequest('POST', '/emails', JSON.stringify(payload), (err, status, rbody) => {
           if (err) return sendJson(res, 502, { error: 'Failed to contact Resend', details: err.message });
           if (status === 200 || status === 201) {
-            const sent = { id: draftId, company: draft.company || '', subject: draft.subject, to: draft.to, sent_at: new Date().toISOString(), resend_id: safeJson(rbody).id };
+            const sent = {
+              id: draftId,
+              company: draft.company || '',
+              from: payload.from,
+              to: draft.to,
+              cc: draft.cc || '',
+              reply_to: draft.reply_to || '',
+              in_reply_to: draft.in_reply_to || '',
+              subject: draft.subject,
+              text: payload.text,
+              html: payload.html,
+              sent_at: new Date().toISOString(),
+              resend_id: safeJson(rbody).id,
+            };
+            if (store) { try { store.markDraftSent(draftId, { bodyText: payload.text, bodyHtml: payload.html }); } catch (e) { console.warn('[DB] markDraftSent:', e.message); } }
             appendSentDraft(sent);
             // Re-read before write: the queue is externally mutable.
             const fresh = readDrafts();
@@ -769,5 +964,5 @@ function safeJson(raw) {
 server.listen(PORT, () => {
   const brand = (CFG.brand && CFG.brand.productName) || 'Email Pad';
   console.log(`✓ ${brand} running on http://127.0.0.1:${PORT} (useCase=${CFG.useCase}, outreach=${OUTREACH_ENABLED ? 'on' : 'off'})`);
-  console.log('  POST /api/send | GET /api/config | GET /api/domains | GET /api/sent | GET /api/received | POST /api/webhook | GET /api/archive | GET/PUT/DELETE /api/drafts | POST /api/drafts/:id/send');
+  console.log('  POST /api/send | GET /api/config | GET /api/domains | GET /api/sent | GET /api/received | POST /api/webhook | GET /api/archive | GET/PUT/DELETE /api/drafts | POST /api/drafts/:id/send | GET/DELETE /api/replies | GET/POST/PATCH /api/leads | GET /api/emails | GET /api/stats');
 });
