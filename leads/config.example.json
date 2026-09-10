@@ -1,0 +1,16 @@
+{
+  "_comment": "Optional pipeline definition for the leads engine. Copy to config.json, or point LEADPAD_CONFIG at it, or pass the same JSON via LEAD_STAGES / LEAD_DUE_DAYS. Defaults (used when this file is absent) are the NewsletterFIT outreach cadence.",
+  "brand": "NewsletterFIT",
+  "stages": [
+    { "key": "leads",       "label": "Leads",       "color": "#64748b", "note": "contact yet to be emailed" },
+    { "key": "first_email", "label": "First Email", "color": "#2563eb", "note": "first email sent" },
+    { "key": "follow_up_1", "label": "Follow-up 1", "color": "#0d9488" },
+    { "key": "follow_up_2", "label": "Follow-up 2", "color": "#4f46e5" },
+    { "key": "follow_up_3", "label": "Follow-up 3", "color": "#7c3aed" },
+    { "key": "follow_up_4", "label": "Follow-up 4", "color": "#d97706" },
+    { "key": "replied",     "label": "Replied",     "color": "#db2777", "terminal": true },
+    { "key": "won",         "label": "Won",         "color": "#16a34a", "terminal": true },
+    { "key": "no",          "label": "No",          "color": "#dc2626", "terminal": true }
+  ],
+  "dueDays": { "first_email": 3, "follow_up_1": 4, "follow_up_2": 7, "follow_up_3": 0 }
+}

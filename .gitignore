@@ -16,3 +16,9 @@ node_modules/
 __pycache__/
 *.pyc
 .DS_Store
+
+# --- leads engine (CRM) state & per-install config ---
+leads/data/*
+!leads/data/.gitkeep
+leads/config.json
+*.bak-*

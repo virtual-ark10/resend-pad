@@ -78,3 +78,57 @@ json.dump(c, open('config.json','w'), indent=2)
 PY
 # restart, then: curl -s -H "X-Pad-Token: $PAD_TOKEN" localhost:3001/api/config | python3 -m json.tool
 ```
+
+## Leads CRM tab (optional)
+
+The pad can front a small **leads engine** — a second zero-dependency Node
+service that owns a JSON lead store and the outreach pipeline, reached through
+this server so the browser only ever needs the pad token.
+
+```
+pad-kit/leads/
+├── server.cjs           # lead store + pipeline API (node:http, no deps)
+├── boot.sh              # starts it on 127.0.0.1:3002
+├── watchdog.sh          # per-minute health check
+└── config.example.json  # optional pipeline definition (stages, cadence)
+```
+
+Extra `config.json` fields:
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `firstTab` | string | `leads` if present, else `compose` | Which tab opens first. Set `compose` for a mail-first pad. |
+| `tabs` | array | preset | Ordered tab list. `{ "id": "leads", "label": "Leads" }` puts the CRM first; `"enabled": false` hides any tab. |
+| `leads.enabled` | bool | `true` | `false` hides the tab and makes `/api/crm/*` return 404 — correct when no engine is wired up. |
+| `leads.port` | number | `3002` | Must match the engine's `PORT` (env `CRM_PORT` overrides). |
+
+```json
+{
+  "firstTab": "leads",
+  "tabs": [
+    { "id": "leads", "label": "Leads" },
+    { "id": "compose", "label": "Compose" },
+    { "id": "drafts", "label": "Drafts" },
+    { "id": "sent", "label": "Sent" },
+    { "id": "received", "label": "Received" }
+  ],
+  "leads": { "enabled": true, "port": 3002 }
+}
+```
+
+The engine configures itself: brand, stages and follow-up cadence come from
+`leads/config.json`, `LEAD_STAGES`, `LEAD_DUE_DAYS` or `LEADPAD_CONFIG`, and it
+inherits the brand name from this pad's `config.json` when `BRAND_NAME` is unset.
+
+Same token on purpose — the pad proxies `/api/crm/*` and injects the engine
+credential server-side (`X-CRM-Token: $PAD_TOKEN`), which the engine also
+accepts. Keep it on localhost; it must never get its own public route.
+
+### Leads tab troubleshooting
+
+| Symptom | Cause / fix |
+|---|---|
+| Leads tab missing | `leads.enabled: false`, or no engine running — the tab hides itself when `/api/config` reports the engine off. |
+| `502 Leads engine unavailable` | Start it: `./leads/boot.sh`; check `leads/watchdog.log`. |
+| Tab empty but email works | Engine up, store empty: `GET /api/crm/meta` shows `total: 0`. Seed with `POST /api/crm/leads`. |
+| Stage never advances after a send | The send must match a lead's `contact_email` — click "Sync email" in the tab, or `POST /api/crm/sync`. |

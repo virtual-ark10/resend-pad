@@ -11,6 +11,9 @@ draft queue, the send log and a Svix-verified webhook archive.
 * **Zero brand coupling** — every brand name, label, tab, template, sender and
   limit comes from `config.json`. The same code runs a cold-outreach pad, a
   newsletter drafting pad or a transactional send log.
+* **Optional leads CRM** — add a `Leads` tab backed by the bundled `leads/`
+  engine: pipeline stages with colours, per-lead email history, notes, and
+  automatic stage advancement when you email a lead. Off in one config line.
 * **Send-time outreach link minting/blocking is optional and OFF by default.**
 
 ```
@@ -18,6 +21,11 @@ pad-kit/
 ├── server.cjs           # the whole HTTP API (node:http, no deps)
 ├── index.html           # single-file client (no CDNs, no build)
 ├── outreach-links.cjs   # OPTIONAL link mint/block + linkify helper
+├── leads/               # OPTIONAL leads CRM engine (own process, own store)
+│   ├── server.cjs       #   lead store + pipeline API
+│   ├── boot.sh          #   starts it on 127.0.0.1:3002
+│   ├── watchdog.sh      #   per-minute health check
+│   └── config.example.json  #  optional pipeline definition
 ├── boot.sh              # self-locating launcher (loads .env)
 ├── watchdog.sh          # per-minute health check + Caddy route self-heal
 ├── add_caddy_route.py   # parameterised Caddy route helper (--path --port)

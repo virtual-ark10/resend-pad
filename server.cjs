@@ -191,6 +191,14 @@ function effectiveConfig() {
 }
 
 const CFG = effectiveConfig();
+
+// ---- leads engine (optional sibling service on an internal port) ----------
+// The pads' Leads tab talks to it through this server, which injects the token,
+// so the browser only ever needs the pad token. Disable with config.json:
+//   "leads": { "enabled": false }
+const CRM_HOST = process.env.CRM_HOST || '127.0.0.1';
+const CRM_PORT = parseInt(process.env.CRM_PORT || String((CFG.leads && CFG.leads.port) || 3002), 10);
+const LEADS_ENABLED = !(CFG.leads && CFG.leads.enabled === false);
 const LIMITS = Object.assign({}, DEFAULT_CONFIG.limits, CFG.limits || {});
 
 // ---------------------------------------------------------------------------
@@ -286,6 +294,31 @@ function forbidden(res, msg) {
 // The safe, front-end-visible subset of the config (never contains secrets)
 // ---------------------------------------------------------------------------
 
+// Thin passthrough to the leads engine: same method/body, engine credential
+// added server-side, response streamed back unchanged.
+function proxyCrm(req, res, targetPath) {
+  const chunks = [];
+  req.on('data', (c) => chunks.push(c));
+  req.on('end', () => {
+    const up = http.request({
+      host: CRM_HOST,
+      port: CRM_PORT,
+      path: targetPath,
+      method: req.method,
+      headers: { 'X-CRM-Token': PAD_TOKEN, 'Content-Type': 'application/json' },
+    }, (r) => {
+      res.writeHead(r.statusCode || 502, {
+        'Content-Type': r.headers['content-type'] || 'application/json',
+        'Cache-Control': 'no-store',
+      });
+      r.pipe(res);
+    });
+    up.on('error', () => sendJson(res, 502, { error: 'Leads engine unavailable — is it running? (leads/boot.sh)' }));
+    if (chunks.length) up.write(Buffer.concat(chunks));
+    up.end();
+  });
+}
+
 function safeConfig() {
   const c = effectiveConfig();
   const lim = Object.assign({}, DEFAULT_CONFIG.limits, c.limits || {});
@@ -297,6 +330,8 @@ function safeConfig() {
     signature: c.signature || { html: '', text: '' },
     labels: Object.assign({}, DEFAULT_CONFIG.labels, c.labels || {}),
     tabs: (Array.isArray(c.tabs) ? c.tabs : []).filter((t) => t && t.id && t.enabled !== false),
+    // lets the client hide the Leads tab when no engine is wired up
+    leads: { enabled: LEADS_ENABLED, port: CRM_PORT },
     templates: c.templates || {},
     tracking: Object.assign({}, DEFAULT_CONFIG.tracking, c.tracking || {}),
     limits: {
@@ -516,6 +551,13 @@ function handleApi(req, res, url, ip) {
     const mask = (s) => s ? s.slice(0, 4) + '…' + s.slice(-4) : '(none)';
     console.log(`[AUTH-FAIL] ${req.method} ${url} got=${mask(auth)} expected=${mask(PAD_TOKEN)}`);
     return sendJson(res, 401, { error: 'Unauthorized — missing or invalid token' });
+  }
+
+  // Leads tab: /api/crm/* -> leads engine, already authorised by the pad token
+  // we just verified. The browser never sees or sends a second credential.
+  if (p === '/api/crm' || p.startsWith('/api/crm/')) {
+    if (!LEADS_ENABLED) return sendJson(res, 404, { error: 'Leads tab disabled in config.json' });
+    return proxyCrm(req, res, '/api' + p.slice('/api/crm'.length));
   }
 
   // ---- Front-end config (branding, labels, tabs, templates, use case) ----
