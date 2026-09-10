@@ -254,12 +254,16 @@ function open(dataDir, opts = {}) {
   withRetry('journal_mode', () => db.exec('PRAGMA journal_mode = WAL'));
   db.exec('PRAGMA synchronous = NORMAL');
   db.exec('PRAGMA foreign_keys = ON');
-  withRetry('schema', () => {
-    db.exec(SCHEMA);
-    // Additive migrations for databases created by an earlier version.
+  // Migrate BEFORE the schema: an existing database already has an events table
+  // without processed_at, and SCHEMA creates an index on that column, so the
+  // index would fail with "no such column" on any database created earlier.
+  withRetry('migrate', () => {
+    const exists = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'events'").get();
+    if (!exists) return;
     const cols = db.prepare('PRAGMA table_info(events)').all().map((c) => c.name);
     if (!cols.includes('processed_at')) db.exec('ALTER TABLE events ADD COLUMN processed_at TEXT');
   });
+  withRetry('schema', () => db.exec(SCHEMA));
   withRetry('schema_version', () => db.prepare('INSERT INTO meta(key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING')
     .run('schema_version', String(SCHEMA_VERSION)));
 
