@@ -25,26 +25,43 @@
   "tabs": [
     {
       "id": "leads",
-      "label": "Leads"
-    },
-    {
-      "id": "drafts",
-      "label": "Drafts",
-      "enabled": true
+      "label": "Leads",
+      "group": "Pipeline"
     },
     {
       "id": "compose",
       "label": "Compose",
+      "group": "Emails",
+      "enabled": true
+    },
+    {
+      "id": "drafts",
+      "label": "Drafts",
+      "group": "Emails",
       "enabled": true
     },
     {
       "id": "sent",
       "label": "Sent",
+      "group": "Emails",
       "enabled": true
     },
     {
       "id": "received",
       "label": "Received",
+      "group": "Emails",
+      "enabled": true
+    },
+    {
+      "id": "trackers",
+      "label": "Trackers",
+      "group": "Emails",
+      "enabled": true
+    },
+    {
+      "id": "analytics",
+      "label": "Analytics",
+      "group": "Insights",
       "enabled": true
     }
   ],
@@ -61,9 +78,11 @@
     }
   },
   "tracking": {
-    "openTracking": false,
-    "clickTracking": false,
-    "trackingSubdomain": ""
+    "_readme": "Resend domain tracking. Open and click tracking must also be enabled on the domain in the Resend dashboard, and delivery events need the webhook below pointed at this pad.",
+    "openTracking": true,
+    "clickTracking": true,
+    "trackingSubdomain": "links",
+    "publicBaseUrl": "https://example.com/pad"
   },
   "limits": {
     "ratePerMinute": 60,
@@ -156,5 +175,27 @@
       "your-own-domain.com"
     ],
     "_inbox_readme": "discoverFromInbox:true turns a new inbound sender into a lead (a reply is a warm lead). ignoreSenders: exact addresses or domains (and their subdomains) that must never become leads - put your tools and your own domain here."
+  },
+  "_tabs_readme": "tabs render in order; an optional \"group\" prints a heading before the first tab of that group (Emails holds Compose/Drafts/Sent/Received/Trackers, Insights holds Analytics). A tab without a panel is hidden automatically.",
+  "analytics": {
+    "_readme": "Website-side analytics for the Analytics tab. Keys stay server-side. Leave a provider blank to see exactly what it needs in the UI; an MCP client can also push metrics to POST /api/analytics/ingest with the pad token.",
+    "ga4": {
+      "enabled": true,
+      "propertyId": "",
+      "credentialsFile": "/app/secrets/ga4-service-account.json",
+      "metrics": [
+        "sessions",
+        "totalUsers",
+        "screenPageViews",
+        "conversions"
+      ]
+    },
+    "posthog": {
+      "enabled": true,
+      "host": "https://us.posthog.com",
+      "projectId": "",
+      "apiKey": "",
+      "event": "$pageview"
+    }
   }
 }

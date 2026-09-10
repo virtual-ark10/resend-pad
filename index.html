@@ -133,6 +133,34 @@
   .modal-body .meta { font-size: 12px; color: var(--muted); margin: 0 0 10px; }
   .modal-body img { max-width: 100%; }
 
+  /* ---------- trackers + analytics ---------- */
+  .nav-group { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted);
+               margin: 0 4px 0 10px; align-self: center; }
+  .nav-group:first-child { margin-left: 0; }
+  .mini { font: inherit; font-size: 12px; padding: 3px 6px; border: 1px solid var(--line); border-radius: 8px; background: #fff; color: var(--ink); }
+  .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 10px; margin: 0 0 14px; }
+  .kpi { border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; background: var(--bg, #fff); }
+  .kpi .k-label { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); }
+  .kpi .k-value { font-size: 20px; font-weight: 700; line-height: 1.25; }
+  .kpi .k-sub { font-size: 11px; color: var(--muted); }
+  .chart-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 14px; }
+  .chart-box { border: 1px solid var(--line); border-radius: 10px; padding: 12px; }
+  .chart-title { font-size: 12px; color: var(--muted); margin: 0 0 8px; }
+  .split2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 14px; margin-top: 14px; }
+  h3.sec { font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin: 16px 0 6px; }
+  table.data { width: 100%; border-collapse: collapse; font-size: 13px; }
+  table.data th, table.data td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--line); }
+  table.data th { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); font-weight: 600; }
+  table.data td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .pill { display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); }
+  .pill.on { color: #0b6b3a; border-color: #b7e2c8; background: #f0fbf4; }
+  .pill.off { color: #8a2d1c; border-color: #f2cdc6; background: #fdf1ef; }
+  .provider { border: 1px solid var(--line); border-radius: 10px; padding: 12px; margin-bottom: 12px; }
+  .provider .p-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 6px; }
+  .provider .p-name { font-weight: 600; }
+  .hint { font-size: 12px; color: var(--muted); }
+  code.inline { background: var(--tint, #f3f8fd); padding: 1px 5px; border-radius: 5px; font-size: 12px; }
+
   footer { margin-top: 22px; color: var(--muted); font-size: 12px; }
   @media (max-width: 620px) { .grid2, .grid3 { grid-template-columns: 1fr; } }
 /* ---------- sidebar: Leads (CRM) on top, email below ---------- */
@@ -276,6 +304,49 @@
 </div>
 
 <!-- ================= MODAL ================= -->
+  <section class="panel" id="panel-trackers">
+    <h2 style="font-size:14px;margin:0 0 8px">Trackers <span class="count" id="trackers_count"></span>
+      <span style="float:right;font-size:12px;font-weight:400">
+        <select id="tracker_days" class="mini" title="Window">
+          <option value="7">7 days</option>
+          <option value="30" selected>30 days</option>
+          <option value="90">90 days</option>
+          <option value="365">12 months</option>
+        </select>
+        <button class="ghost" id="btn_tracker_refresh" style="font-size:12px;padding:4px 10px">Refresh from Resend</button>
+      </span>
+    </h2>
+    <div class="sub" id="tracker_note" style="margin:0 0 10px"></div>
+    <div class="kpis" id="tracker_kpis"></div>
+    <div class="chart-grid">
+      <div class="chart-box"><div class="chart-title">Volume per day</div><canvas id="ch_flow" height="200"></canvas></div>
+      <div class="chart-box"><div class="chart-title">Delivery quality per day</div><canvas id="ch_quality" height="200"></canvas></div>
+      <div class="chart-box"><div class="chart-title">Funnel (unique sends)</div><canvas id="ch_funnel" height="200"></canvas></div>
+      <div class="chart-box"><div class="chart-title">Event mix</div><canvas id="ch_mix" height="200"></canvas></div>
+    </div>
+    <div class="split2">
+      <div><h3 class="sec">Most clicked links</h3><div id="tracker_links"></div></div>
+      <div><h3 class="sec">Most engaged leads</h3><div id="tracker_leads"></div></div>
+    </div>
+    <h3 class="sec">Recent events</h3>
+    <div id="tracker_events"></div>
+  </section>
+
+  <section class="panel" id="panel-analytics">
+    <h2 style="font-size:14px;margin:0 0 8px">Analytics
+      <span style="float:right;font-size:12px;font-weight:400">
+        <select id="analytics_days" class="mini" title="Window">
+          <option value="7">7 days</option>
+          <option value="30" selected>30 days</option>
+          <option value="90">90 days</option>
+        </select>
+        <button class="ghost" id="btn_analytics_refresh" style="font-size:12px;padding:4px 10px">Refresh</button>
+      </span>
+    </h2>
+    <div class="sub" id="analytics_note" style="margin:0 0 10px"></div>
+    <div id="analytics_providers"></div>
+  </section>
+
 <div class="modal-mask" id="modal_mask">
   <div class="modal" style="pointer-events:auto" onclick="event.stopPropagation()">
     <div class="modal-head">
@@ -287,6 +358,7 @@
   </div>
 </div>
 
+<script src="vendor/chart.umd.min.js"></script>
 <script>
 "use strict";
 const PAD_VERSION = "3.0";
@@ -309,11 +381,13 @@ const DEFAULTS = {
   },
   firstTab: "",
   tabs: [
-    { id: "leads", label: "Leads" },
-    { id: "compose", label: "Compose" },
-    { id: "drafts", label: "Drafts" },
-    { id: "sent", label: "Sent" },
-    { id: "received", label: "Received" }
+    { id: "leads", label: "Leads", group: "Pipeline" },
+    { id: "compose", label: "Compose", group: "Emails" },
+    { id: "drafts", label: "Drafts", group: "Emails" },
+    { id: "sent", label: "Sent", group: "Emails" },
+    { id: "received", label: "Received", group: "Emails" },
+    { id: "trackers", label: "Trackers", group: "Emails" },
+    { id: "analytics", label: "Analytics", group: "Insights" }
   ],
   templates: {
     blank: { label: "Blank short note", subject: "", body: "<p>Hi {{first_name}},</p><p></p>{{signature}}" }
@@ -395,15 +469,22 @@ function applyConfig(cfg) {
 }
 
 function renderTabs() {
+  setTimeout(initTrackers, 0);
   // A tab is shown unless config disables it; the leads tab additionally needs
   // the leads engine wired up (CFG.leads.enabled comes from /api/config).
   const tabs = (Array.isArray(CFG.tabs) && CFG.tabs.length ? CFG.tabs : DEFAULTS.tabs)
     .filter((t) => t && t.id && t.enabled !== false)
     .filter((t) => t.id !== "leads" || !CFG.leads || CFG.leads.enabled !== false);
   const nav = $("tabs");
-  nav.innerHTML = tabs.map((t) =>
-    `<button class="tab" data-tab="${esc(t.id)}">${esc(t.label || t.id)} <span class="count" id="cnt_${esc(t.id)}"></span></button>`
-  ).join("");
+  // Optional grouping: a tab may carry { group: "Emails" } and the nav then shows
+  // a small heading before the first tab of that group (Emails holds Compose,
+  // Drafts, Sent, Received and Trackers; Insights holds Analytics).
+  let lastGroup = null;
+  nav.innerHTML = tabs.map((t) => {
+    const head = (t.group && t.group !== lastGroup) ? `<span class="nav-group">${esc(t.group)}</span>` : "";
+    lastGroup = t.group || null;
+    return head + `<button class="tab" data-tab="${esc(t.id)}">${esc(t.label || t.id)} <span class="count" id="cnt_${esc(t.id)}"></span></button>`;
+  }).join("");
   tabs.forEach((t) => {
     const panel = $("panel-" + t.id);
     if (panel) panel.classList.toggle("hidden-by-config", false);
@@ -458,6 +539,8 @@ function switchTab(tab) {
   if (tab === "drafts") loadDrafts();
   if (tab === "sent") loadSent();
   if (tab === "received") loadReceived();
+  if (tab === "trackers") loadTrackers();
+  if (tab === "analytics") loadAnalytics();
 }
 
 // ---------- connect ----------
@@ -823,6 +906,200 @@ function replyTo(addr, subject, messageId) {
   $("editor").innerHTML = "<p>Write your email…</p>";
   editorHTML = "";
   setStatus("Reply drafted — send address and thread are linked automatically.", true);
+}
+
+// ---------- trackers (Resend delivery + engagement) ----------
+const CHARTS = {};
+const TRACK_COLORS = {
+  sent: "#64748b", delivered: "#2563eb", opened: "#0d9488", clicked: "#7c3aed",
+  bounced: "#dc2626", complained: "#d97706", delivery_delayed: "#94a3b8",
+  failed: "#b91c1c", scheduled: "#0891b2", canceled: "#475569",
+};
+const fmtNum = (n) => (n === null || n === undefined) ? "-" : Number(n).toLocaleString();
+const pctStr = (n) => (n === null || n === undefined) ? "-" : n + "%";
+const dayLabel = (d) => String(d || "").slice(5);
+
+function drawChart(id, config) {
+  const el = document.getElementById(id);
+  if (!el || typeof Chart === "undefined") return;
+  if (CHARTS[id]) CHARTS[id].destroy();
+  CHARTS[id] = new Chart(el.getContext("2d"), config);
+}
+
+function kpi(label, value, sub) {
+  return `<div class="kpi"><div class="k-label">${esc(label)}</div><div class="k-value">${value}</div>`
+    + (sub ? `<div class="k-sub">${esc(sub)}</div>` : "") + `</div>`;
+}
+
+async function loadTrackers() {
+  const days = Number((document.getElementById("tracker_days") || {}).value || 30);
+  const note = document.getElementById("tracker_note");
+  const list = document.getElementById("tracker_events");
+  note.textContent = "Loading...";
+  try {
+    const s = await api("api/trackers/summary?days=" + days, authed("GET"));
+    const t = s.totals || {};
+    const r = s.rates || {};
+    if (document.getElementById("trackers_count")) {
+      document.getElementById("trackers_count").textContent = s.sends_tracked ? "(" + s.sends_tracked + ")" : "";
+    }
+    document.getElementById("tracker_kpis").innerHTML = [
+      kpi("Sends tracked", fmtNum(s.sends_tracked), "window: " + days + " days"),
+      kpi("Delivered", fmtNum(s.unique_delivered), pctStr(r.delivery) + " delivery rate"),
+      kpi("Opens", fmtNum(t.opened), pctStr(r.open) + " open rate"),
+      kpi("Clicks", fmtNum(t.clicked), pctStr(r.click) + " click rate, " + pctStr(r.click_to_open) + " of opens"),
+      kpi("Bounces", fmtNum(t.bounced), pctStr(r.bounce) + " bounce rate"),
+      kpi("Complaints", fmtNum(t.complained), pctStr(r.complaint) + " complaint rate"),
+      kpi("Failed", fmtNum(t.failed), "rejected by the receiving side"),
+      kpi("Last event", s.last_event_at ? fmtDate(s.last_event_at) : "-", (s.by_source || []).map((x) => x.source + " " + x.n).join(", ")),
+    ].join("");
+
+    const tk = s.tracking || {};
+    const warnings = [];
+    if (!tk.openTracking) warnings.push("open tracking is off for this domain (Resend dashboard -> Domains -> Tracking)");
+    if (!tk.clickTracking) warnings.push("click tracking is off for this domain");
+    if (!tk.webhook_configured) warnings.push("no webhook signing secret set, so live opens/clicks arrive only when you press Refresh");
+    note.innerHTML = warnings.length
+      ? "Only what Resend reports is shown. " + warnings.map(esc).join("; ") + ". Events recorded: " + fmtNum((s.recent || []).length) + " recent."
+      : "Tracking is on and the webhook is configured. Events are recorded as Resend reports them.";
+
+    const labels = (s.series || []).map((d) => dayLabel(d.day));
+    const line = (key, label) => ({
+      label, data: (s.series || []).map((d) => d[key] || 0),
+      borderColor: TRACK_COLORS[key] || "#888", backgroundColor: (TRACK_COLORS[key] || "#888") + "22",
+      tension: .3, fill: false, borderWidth: 2, pointRadius: 0,
+    });
+    drawChart("ch_flow", {
+      type: "line",
+      data: { labels, datasets: [line("sent", "sent"), line("delivered", "delivered"), line("opened", "opened"), line("clicked", "clicked")] },
+      options: { responsive: true, plugins: { legend: { position: "bottom", labels: { boxWidth: 10, font: { size: 11 } } } },
+        scales: { y: { beginAtZero: true, ticks: { precision: 0 } }, x: { ticks: { maxTicksLimit: 8 } } } },
+    });
+    drawChart("ch_quality", {
+      type: "bar",
+      data: { labels, datasets: [
+        { label: "bounced", data: (s.series || []).map((d) => d.bounced || 0), backgroundColor: TRACK_COLORS.bounced },
+        { label: "complained", data: (s.series || []).map((d) => d.complained || 0), backgroundColor: TRACK_COLORS.complained },
+        { label: "delivery delayed", data: (s.series || []).map((d) => d.delivery_delayed || 0), backgroundColor: TRACK_COLORS.delivery_delayed },
+      ] },
+      options: { responsive: true, plugins: { legend: { position: "bottom", labels: { boxWidth: 10, font: { size: 11 } } } },
+        scales: { x: { stacked: true, ticks: { maxTicksLimit: 8 } }, y: { stacked: true, beginAtZero: true, ticks: { precision: 0 } } } },
+    });
+    drawChart("ch_funnel", {
+      type: "bar",
+      data: { labels: (s.funnel || []).map((f) => f.step), datasets: [{
+        label: "unique sends", data: (s.funnel || []).map((f) => f.n),
+        backgroundColor: ["#64748b", "#2563eb", "#0d9488", "#7c3aed", "#db2777"],
+      }] },
+      options: { indexAxis: "y", responsive: true, plugins: { legend: { display: false } }, scales: { x: { beginAtZero: true, ticks: { precision: 0 } } } },
+    });
+    const mixEntries = Object.entries(t).filter(([, n]) => n > 0);
+    drawChart("ch_mix", {
+      type: "doughnut",
+      data: { labels: mixEntries.map(([k]) => k), datasets: [{ data: mixEntries.map(([, n]) => n), backgroundColor: mixEntries.map(([k]) => TRACK_COLORS[k] || "#94a3b8") }] },
+      options: { responsive: true, plugins: { legend: { position: "bottom", labels: { boxWidth: 10, font: { size: 11 } } } } },
+    });
+
+    const links = s.top_links || [];
+    document.getElementById("tracker_links").innerHTML = links.length
+      ? `<table class="data"><tr><th>Link</th><th class="num">Clicks</th></tr>` + links.map((l) =>
+          `<tr><td style="word-break:break-all">${esc(l.url)}</td><td class="num">${fmtNum(l.clicks)}</td></tr>`).join("") + `</table>`
+      : '<div class="empty">No clicks recorded in this window. Click tracking must be on for the domain.</div>';
+
+    const tl = s.top_leads || [];
+    document.getElementById("tracker_leads").innerHTML = tl.length
+      ? `<table class="data"><tr><th>Lead</th><th class="num">Opens</th><th class="num">Clicks</th></tr>` + tl.map((l) =>
+          `<tr><td>${esc(l.who || l.lead_id)}</td><td class="num">${fmtNum(l.opens)}</td><td class="num">${fmtNum(l.clicks)}</td></tr>`).join("") + `</table>`
+      : '<div class="empty">No engagement yet.</div>';
+
+    const ev = s.recent || [];
+    list.innerHTML = ev.length
+      ? `<table class="data"><tr><th>When</th><th>Event</th><th>To</th><th>Detail</th><th>Source</th></tr>` + ev.map((e) =>
+          `<tr><td>${fmtDate(e.occurred_at)}</td><td>${esc(e.type)}</td><td>${esc(e.to_addr || "")}</td>` +
+          `<td style="word-break:break-all">${esc(e.url || e.bounce_type || e.subject || "")}</td><td>${esc(e.source || "")}</td></tr>`).join("") + `</table>`
+      : '<div class="empty">Nothing recorded yet. Send something, or press Refresh from Resend.</div>';
+  } catch (e) {
+    note.textContent = "Could not load trackers: " + e.message;
+    list.innerHTML = "";
+  }
+}
+
+async function refreshTrackers() {
+  const btn = document.getElementById("btn_tracker_refresh");
+  const note = document.getElementById("tracker_note");
+  btn.disabled = true;
+  note.textContent = "Asking Resend for the latest status of recent sends...";
+  try {
+    const out = await api("api/trackers/refresh", authed("POST", { limit: 100 }));
+    note.textContent = `Checked ${out.checked || 0} sends: ${out.stored || 0} new events, ${out.unchanged || 0} already known.`;
+  } catch (e) {
+    note.textContent = "Refresh failed: " + e.message;
+  } finally {
+    btn.disabled = false;
+    loadTrackers();
+  }
+}
+
+// ---------- analytics (GA4, PostHog, MCP push) ----------
+async function loadAnalytics() {
+  const days = Number((document.getElementById("analytics_days") || {}).value || 30);
+  const note = document.getElementById("analytics_note");
+  const host = document.getElementById("analytics_providers");
+  note.textContent = "Loading...";
+  try {
+    const s = await api("api/analytics/summary?days=" + days, authed("GET"));
+    const providers = s.providers || [];
+    note.textContent = providers.some((p) => p.configured)
+      ? "Fetched server-side; keys never reach the browser."
+      : "Nothing is connected yet. The panel below lists exactly what each provider needs.";
+    host.innerHTML = providers.map((p, i) => {
+      const metrics = p.metrics || {};
+      const hasData = Object.values(metrics).some((v) => Array.isArray(v) && v.length);
+      const pill = p.configured && hasData ? '<span class="pill on">connected</span>' : '<span class="pill off">not connected</span>';
+      const totals = Object.entries(p.totals || {}).map(([k, v]) => `<span class="pill">${esc(k)}: ${fmtNum(v)}</span>`).join(" ");
+      const chartId = "ch_provider_" + i;
+      if (hasData) {
+        setTimeout(() => {
+          const labels = (p.days || (metrics[Object.keys(metrics)[0]] || []).map((x) => x.day)).map(dayLabel);
+          const datasets = Object.entries(metrics).filter(([, v]) => Array.isArray(v) && v.length).map(([metric, pts], idx) => ({
+            label: metric,
+            data: labels.map((d) => { const row = pts.find((x) => dayLabel(x.day) === d); return row ? row.value : 0; }),
+            borderColor: ["#2563eb", "#0d9488", "#7c3aed", "#d97706", "#dc2626"][idx % 5],
+            backgroundColor: "transparent", tension: .3, borderWidth: 2, pointRadius: 0,
+          }));
+          drawChart(chartId, { type: "line", data: { labels, datasets },
+            options: { responsive: true, plugins: { legend: { position: "bottom", labels: { boxWidth: 10, font: { size: 11 } } } }, scales: { y: { beginAtZero: true } } } });
+        }, 0);
+      }
+      const hint = p.id === "ga4"
+        ? 'Needs <code class="inline">analytics.ga4.propertyId</code> and a service account: <code class="inline">analytics.ga4.credentialsFile</code> (the JSON key file) with read access to the property.'
+        : p.id === "posthog"
+          ? 'Needs <code class="inline">analytics.posthog.host</code>, <code class="inline">.projectId</code> and a personal API key in <code class="inline">.apiKey</code>.'
+          : 'No keys needed: have the MCP client POST to <code class="inline">/api/analytics/ingest</code> with the pad token, body <code class="inline">{"provider":"posthog","metric":"pageviews","points":[{"day":"2026-09-10","value":42}]}</code>.';
+      return `<div class="provider">
+        <div class="p-head"><span class="p-name">${esc(p.name || p.id)}</span>${pill}
+          <span class="pill">via ${esc(p.via || "API")}</span>${totals}</div>
+        ${p.error ? `<div class="hint" style="color:#8a2d1c">${esc(p.error)}</div>` : ""}
+        ${p.note ? `<div class="hint">${esc(p.note)}</div>` : ""}
+        ${hasData ? `<canvas id="${chartId}" height="180" style="margin-top:8px"></canvas>` : ""}
+        <div class="hint" style="margin-top:6px">${hint}</div>
+      </div>`;
+    }).join("");
+  } catch (e) {
+    note.textContent = "Could not load analytics: " + e.message;
+    host.innerHTML = "";
+  }
+}
+
+function initTrackers() {
+  const days = document.getElementById("tracker_days");
+  if (days) days.addEventListener("change", loadTrackers);
+  const btn = document.getElementById("btn_tracker_refresh");
+  if (btn) btn.addEventListener("click", refreshTrackers);
+  const adays = document.getElementById("analytics_days");
+  if (adays) adays.addEventListener("change", loadAnalytics);
+  const abtn = document.getElementById("btn_analytics_refresh");
+  if (abtn) abtn.addEventListener("click", loadAnalytics);
 }
 
 // ---------- modal ----------

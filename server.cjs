@@ -262,6 +262,238 @@ const store = require('./db.cjs').open(DATA_DIR, {
 // The rules table is the backbone: an event fired here (or by the leads engine)
 // is drained on the next request and performs its next action.
 const rules = store ? require('./hooks.cjs').buildRules(store) : null;
+
+// ---------------------------------------------------------------------------
+// Resend tracking + analytics providers
+//
+// Trackers: every delivery/engagement event Resend reports (webhook, or polled
+// from the API) lands in tracker_events and the Dashboard charts it.
+// Analytics: website-side metrics. GA4 and PostHog are fetched server-side when
+// configured, and an MCP client can push points in through /api/analytics/ingest
+// when it is not (see docs/TRACKERS.md).
+// ---------------------------------------------------------------------------
+const TRACKING_CFG = (CFG.tracking && typeof CFG.tracking === 'object') ? CFG.tracking : {};
+const ANALYTICS_CFG = (CFG.analytics && typeof CFG.analytics === 'object') ? CFG.analytics : {};
+const UA = 'pad-kit-tracking/1.0';
+const DEFAULT_GA_METRICS = ['sessions', 'totalUsers', 'screenPageViews', 'conversions'];
+const TRACKER_TYPES = ['sent', 'delivered', 'delivery_delayed', 'opened', 'clicked', 'bounced', 'complained', 'failed', 'scheduled', 'canceled'];
+
+/** Minimal JSON over HTTP(S) with a timeout, so no provider can hang a request. */
+function httpsJson(urlStr, { method = 'GET', headers = {}, body = null, timeout = 15000 } = {}) {
+  return new Promise((resolve) => {
+    let u;
+    try { u = new URL(urlStr); } catch (e) { return resolve({ error: 'bad url: ' + urlStr }); }
+    const lib = u.protocol === 'http:' ? http : https;
+    const payload = body === null ? null : (typeof body === 'string' ? body : JSON.stringify(body));
+    const req = lib.request({
+      method,
+      host: u.hostname,
+      port: u.port || (u.protocol === 'http:' ? 80 : 443),
+      path: u.pathname + u.search,
+      headers: Object.assign({ 'User-Agent': UA, Accept: 'application/json' },
+        payload ? { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) } : {}, headers),
+      timeout,
+    }, (r) => {
+      const chunks = [];
+      r.on('data', (c) => chunks.push(c));
+      r.on('end', () => {
+        const text = Buffer.concat(chunks).toString('utf8');
+        let json = null;
+        try { json = JSON.parse(text); } catch (e) { json = null; }
+        resolve({ status: r.statusCode, json, text });
+      });
+    });
+    req.on('timeout', () => { req.destroy(); resolve({ error: `timeout after ${timeout}ms` }); });
+    req.on('error', (e) => resolve({ error: e.message }));
+    if (payload) req.write(payload);
+    req.end();
+  });
+}
+
+/** Resend webhook event -> a tracker_events row. */
+function trackFromWebhook(event) {
+  if (!store || !event || typeof event.type !== 'string') return null;
+  const type = event.type.startsWith('email.') ? event.type.slice('email.'.length) : null;
+  if (!type || !TRACKER_TYPES.includes(type)) return null;
+  const d = event.data || {};
+  const to = Array.isArray(d.to) ? d.to[0] : d.to;
+  const bounce = d.bounce && d.bounce.type ? String(d.bounce.type).toLowerCase() : null;
+  return store.trackEvent({
+    type,
+    resend_id: d.email_id || d.id || null,
+    occurred_at: d.created_at || event.created_at || new Date().toISOString(),
+    url: (d.click && d.click.link) || null,
+    user_agent: d.user_agent || null,
+    ip: d.ip || null,
+    bounce_type: bounce ? (bounce.startsWith('perm') ? 'hard' : 'soft') : null,
+    subject: d.subject || null,
+    to_addr: to || null,
+    source: 'webhook',
+    raw: event,
+  });
+}
+
+/** Ask Resend for the current status of recent sends and record what we learn. */
+function refreshTracking(limit = 100) {
+  return new Promise((resolve) => {
+    resendRequest('GET', `/emails?limit=${Math.min(Math.max(Number(limit) || 100, 1), 100)}`, null, (err, status, rbody) => {
+      if (err) return resolve({ ok: false, error: err.message, stored: 0 });
+      if (status !== 200) return resolve({ ok: false, error: `resend ${status}`, stored: 0 });
+      const payload = safeJson(rbody) || {};
+      const items = Array.isArray(payload.data) ? payload.data : [];
+      let stored = 0;
+      let skipped = 0;
+      for (const item of items) {
+        const type = String(item.last_event || '').toLowerCase();
+        if (!type) { skipped += 1; continue; }
+        const res = store.trackEvent({
+          type,
+          resend_id: item.id,
+          occurred_at: item.created_at || new Date().toISOString(),
+          subject: item.subject || null,
+          to_addr: Array.isArray(item.to) ? item.to[0] : item.to,
+          source: 'poll',
+        });
+        if (res && res.stored) stored += 1; else skipped += 1;
+      }
+      resolve({ ok: true, checked: items.length, stored, unchanged: skipped, at: new Date().toISOString() });
+    });
+  });
+}
+
+// ---- Google Analytics 4 (Data API, service account) ----
+let gaToken = { value: null, expires: 0 };
+const b64url = (buf) => Buffer.from(buf).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+
+async function ga4AccessToken(cfg) {
+  if (gaToken.value && Date.now() < gaToken.expires) return { token: gaToken.value };
+  let creds = cfg.credentialsJson || null;
+  if (!creds && cfg.credentialsFile) {
+    try { creds = JSON.parse(fs.readFileSync(cfg.credentialsFile, 'utf8')); }
+    catch (e) { return { error: `cannot read analytics.ga4.credentialsFile: ${e.message}` }; }
+  }
+  if (!creds || !creds.client_email || !creds.private_key) {
+    return { error: 'no service account: set analytics.ga4.credentialsFile (or credentialsJson)' };
+  }
+  const now = Math.floor(Date.now() / 1000);
+  const header = b64url(JSON.stringify({ alg: 'RS256', typ: 'JWT' }));
+  const claims = b64url(JSON.stringify({
+    iss: creds.client_email,
+    scope: 'https://www.googleapis.com/auth/analytics.readonly',
+    aud: 'https://oauth2.googleapis.com/token',
+    iat: now,
+    exp: now + 3600,
+  }));
+  let signature;
+  try {
+    const signer = crypto.createSign('RSA-SHA256');
+    signer.update(`${header}.${claims}`);
+    signature = b64url(signer.sign(creds.private_key));
+  } catch (e) { return { error: 'could not sign the JWT: ' + e.message }; }
+  const r = await httpsJson('https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=${encodeURIComponent(`${header}.${claims}.${signature}`)}`,
+  });
+  if (r.error) return { error: r.error };
+  if (!r.json || !r.json.access_token) return { error: (r.json && (r.json.error_description || r.json.error)) || 'token exchange failed' };
+  gaToken = { value: r.json.access_token, expires: Date.now() + ((r.json.expires_in || 3600) - 60) * 1000 };
+  return { token: gaToken.value };
+}
+
+async function analyticsGa4(days) {
+  const cfg = ANALYTICS_CFG.ga4 || {};
+  const out = { id: 'ga4', name: cfg.name || 'Google Analytics 4', via: 'Data API', configured: false, metrics: {}, totals: {}, source: null, days: [] };
+  for (let i = days - 1; i >= 0; i -= 1) out.days.push(new Date(Date.now() - i * 86400000).toISOString().slice(0, 10));
+  if (cfg.enabled === false) { out.error = 'disabled in config.json'; return out; }
+  const propertyId = cfg.propertyId || process.env.GA4_PROPERTY_ID || '';
+  if (!propertyId) { out.error = 'set analytics.ga4.propertyId in config.json'; return out; }
+  const tok = await ga4AccessToken(cfg);
+  if (tok.error) { out.error = tok.error; return out; }
+  const metrics = Array.isArray(cfg.metrics) && cfg.metrics.length ? cfg.metrics : DEFAULT_GA_METRICS;
+  const r = await httpsJson(`https://analyticsdata.googleapis.com/v1beta/properties/${propertyId}:runReport`, {
+    method: 'POST',
+    headers: { Authorization: 'Bearer ' + tok.token },
+    body: {
+      dateRanges: [{ startDate: `${days}daysAgo`, endDate: 'today' }],
+      dimensions: [{ name: 'date' }],
+      metrics: metrics.map((m) => ({ name: m })),
+      limit: days + 5,
+    },
+  });
+  if (r.error) { out.error = r.error; return out; }
+  if (r.json && r.json.error) { out.error = r.json.error.message || 'GA4 error'; return out; }
+  const points = {};
+  for (const m of metrics) points[m] = [];
+  for (const row of (r.json && r.json.rows) || []) {
+    const raw = (row.dimensionValues && row.dimensionValues[0] && row.dimensionValues[0].value) || '';
+    const day = raw.length === 8 ? `${raw.slice(0, 4)}-${raw.slice(4, 6)}-${raw.slice(6, 8)}` : raw;
+    (row.metricValues || []).forEach((mv, i) => {
+      const name = metrics[i];
+      if (points[name]) points[name].push({ day, value: Number(mv.value) || 0 });
+    });
+  }
+  out.configured = true;
+  out.metrics = points;
+  out.totals = Object.fromEntries(Object.entries(points).map(([k, v]) => [k, v.reduce((n, pt) => n + pt.value, 0)]));
+  out.source = 'api';
+  out.property_id = String(propertyId);
+  try { for (const [m, pts] of Object.entries(points)) store.putAnalyticsPoints('ga4', m, pts, 'api'); } catch (e) { /* cache is best effort */ }
+  return out;
+}
+
+// ---- PostHog (insights API; MCP clients can push instead) ----
+async function analyticsPosthog(days) {
+  const cfg = ANALYTICS_CFG.posthog || {};
+  const out = { id: 'posthog', name: cfg.name || 'PostHog', via: 'API', configured: false, metrics: {}, totals: {}, source: null, days: [] };
+  for (let i = days - 1; i >= 0; i -= 1) out.days.push(new Date(Date.now() - i * 86400000).toISOString().slice(0, 10));
+  if (cfg.enabled === false) { out.error = 'disabled in config.json'; return out; }
+  const host = (cfg.host || process.env.POSTHOG_HOST || '').replace(/\/$/, '');
+  const projectId = cfg.projectId || process.env.POSTHOG_PROJECT_ID || '';
+  const apiKey = cfg.apiKey || process.env.POSTHOG_API_KEY || '';
+  if (!host || !projectId || !apiKey) {
+    out.error = 'set analytics.posthog.host, .projectId and .apiKey in config.json (or push points via /api/analytics/ingest)';
+  } else {
+    const wanted = [
+      { metric: 'pageviews', event: cfg.event || '$pageview', math: 'total' },
+      { metric: 'users', event: cfg.event || '$pageview', math: 'dau' },
+    ];
+    const collected = {};
+    const errors = [];
+    for (const w of wanted) {
+      const qs = `events=${encodeURIComponent(JSON.stringify([{ id: w.event, math: w.math }]))}&date_from=-${days}d&interval=day`;
+      const r = await httpsJson(`${host}/api/projects/${encodeURIComponent(projectId)}/insights/trend/?${qs}`, {
+        headers: { Authorization: 'Bearer ' + apiKey },
+      });
+      if (r.error) { errors.push(r.error); continue; }
+      if (r.json && r.json.detail) { errors.push(String(r.json.detail)); continue; }
+      const first = (r.json && Array.isArray(r.json.result) && r.json.result[0]) || null;
+      if (!first || !Array.isArray(first.data)) { errors.push(`unexpected shape for ${w.metric}`); continue; }
+      collected[w.metric] = (first.days || []).map((day, i) => ({ day: String(day).slice(0, 10), value: Number(first.data[i]) || 0 }));
+    }
+    if (Object.keys(collected).length) {
+      out.configured = true;
+      out.metrics = collected;
+      out.totals = Object.fromEntries(Object.entries(collected).map(([k, v]) => [k, v.reduce((n, pt) => n + pt.value, 0)]));
+      out.source = 'api';
+      try { for (const [m, pts] of Object.entries(collected)) store.putAnalyticsPoints('posthog', m, pts, 'api'); } catch (e) { /* best effort */ }
+    } else {
+      out.error = errors[0] || 'no data returned';
+    }
+  }
+  if (!out.configured) {
+    const pushed = store.analyticsPoints('posthog', { days });
+    if (Object.keys(pushed.metrics).length) {
+      out.metrics = pushed.metrics;
+      out.via = 'MCP push';
+      out.source = 'ingest';
+      out.updated_at = pushed.updated_at;
+      out.totals = Object.fromEntries(Object.entries(pushed.metrics).map(([k, v]) => [k, v.reduce((n, pt) => n + (pt.value || 0), 0)]));
+      out.note = (out.error ? out.error + ' - ' : '') + 'showing points pushed in over the MCP bridge';
+    }
+  }
+  return out;
+}
 if (store) console.log(`[DB] sqlite store ready: ${store.file} (stages: ${store.stageOrder.join(', ')})`);
 else console.warn('[DB] node:sqlite unavailable in this Node runtime - falling back to JSON/JSONL files');
 
@@ -379,6 +611,16 @@ function safeConfig() {
     tabs: (Array.isArray(c.tabs) ? c.tabs : []).filter((t) => t && t.id && t.enabled !== false),
     // lets the client hide the Leads tab when no engine is wired up
     leads: { enabled: LEADS_ENABLED, port: CRM_PORT },
+    tracking: {
+      openTracking: !!TRACKING_CFG.openTracking,
+      clickTracking: !!TRACKING_CFG.clickTracking,
+      trackingSubdomain: TRACKING_CFG.trackingSubdomain || '',
+      webhookConfigured: !!WEBHOOK_SECRET,
+    },
+    analyticsProviders: [
+      { id: 'ga4', name: (ANALYTICS_CFG.ga4 && ANALYTICS_CFG.ga4.name) || 'Google Analytics 4', configured: !!((ANALYTICS_CFG.ga4 && ANALYTICS_CFG.ga4.propertyId)) },
+      { id: 'posthog', name: (ANALYTICS_CFG.posthog && ANALYTICS_CFG.posthog.name) || 'PostHog', configured: !!((ANALYTICS_CFG.posthog && ANALYTICS_CFG.posthog.host && ANALYTICS_CFG.posthog.apiKey)) },
+    ],
     redraftReasons: LEADS_CFG.redraftReasons || ['Too long', 'Too salesy', 'Wrong angle', 'Wrong offer', 'Tone off', 'Missing detail', 'Not personalised'],
     templates: c.templates || {},
     tracking: Object.assign({}, DEFAULT_CONFIG.tracking, c.tracking || {}),
@@ -590,6 +832,8 @@ function handleApi(req, res, url, ip) {
           const d = event.data || {};
           if (d.email_id) store.updateEmailStatus(d.email_id, String(event.type || '').split('.').pop());
           store.event('system', d.email_id || d.id || null, 'webhook', { type: event.type || 'unknown' });
+          const tracked = trackFromWebhook(event);
+          if (tracked && tracked.stored) console.log(`[TRACK] ${event.type} for ${d.email_id || '?'}`);
         } catch (e) { console.warn('[DB] webhook:', e.message); }
       }
       appendWebhookLog({ received_at: new Date().toISOString(), event }).then((written) => {
@@ -888,6 +1132,93 @@ function handleApi(req, res, url, ip) {
     return withStore(() => sendJson(res, 200, rules ? store.processEvents(rules) : { processed: 0, actions: [] }));
   }
 
+  // ---- Trackers: Resend delivery + engagement ----
+  if (store && p === '/api/trackers/summary' && req.method === 'GET') {
+    return withStore(() => {
+      const days = Math.max(1, Math.min(parseInt(new URL(url, 'http://x').searchParams.get('days') || '30', 10) || 30, 365));
+      sendJson(res, 200, Object.assign(store.trackerSummary({ days }), {
+        tracking: {
+          openTracking: !!TRACKING_CFG.openTracking,
+          clickTracking: !!TRACKING_CFG.clickTracking,
+          trackingSubdomain: TRACKING_CFG.trackingSubdomain || '',
+          webhook_configured: !!WEBHOOK_SECRET,
+          webhook_url: (TRACKING_CFG.publicBaseUrl || '') + '/api/webhook',
+        },
+      }));
+    });
+  }
+
+  if (store && p === '/api/trackers/events' && req.method === 'GET') {
+    return withStore(() => {
+      const q = new URL(url, 'http://x');
+      sendJson(res, 200, {
+        data: store.trackerEvents({
+          limit: parseInt(q.searchParams.get('limit') || '100', 10),
+          type: q.searchParams.get('type') || undefined,
+          resendId: q.searchParams.get('resend_id') || undefined,
+        }),
+      });
+    });
+  }
+
+  if (store && p.startsWith('/api/trackers/email/') && req.method === 'GET') {
+    return withStore(() => {
+      const id = decodeURIComponent(p.slice('/api/trackers/email/'.length));
+      sendJson(res, 200, store.trackerTimeline(id));
+    });
+  }
+
+  // Pull the current status of recent sends from Resend and record what changed.
+  if (store && p === '/api/trackers/refresh' && req.method === 'POST') {
+    return readBody(req, res, (body) => withStore(() => {
+      let limit = 100;
+      try { limit = JSON.parse(body || '{}').limit || 100; } catch (e) { /* default */ }
+      refreshTracking(limit).then((out) => {
+        out.summary = store.trackerSummary({ days: 30 });
+        sendJson(res, out.ok ? 200 : 502, out);
+      });
+      return undefined;
+    }));
+  }
+
+  // ---- Analytics providers (GA4, PostHog) ----
+  if (p === '/api/analytics/summary' && req.method === 'GET') {
+    const days = Math.max(1, Math.min(parseInt(new URL(url, 'http://x').searchParams.get('days') || '30', 10) || 30, 365));
+    return Promise.all([analyticsGa4(days), analyticsPosthog(days)]).then(([ga4, posthog]) => {
+      const pushed = store ? store.analyticsIngested({ days }) : { metrics: {}, providers: [] };
+      sendJson(res, 200, {
+        days,
+        providers: [ga4, posthog, {
+          id: 'mcp',
+          name: 'Pushed over MCP',
+          via: 'MCP bridge',
+          configured: Object.keys(pushed.metrics).length > 0,
+          metrics: pushed.metrics,
+          updated_at: pushed.updated_at || null,
+          source: 'ingest',
+          providers_pushed: pushed.providers,
+          note: 'POST /api/analytics/ingest with the pad token: { provider, metric, points: [{ day, value }] }',
+        }],
+      });
+    }).catch((e) => sendJson(res, 500, { error: String(e && e.message) }));
+  }
+
+  // MCP bridge: an external client (mcporter, a script) pushes metrics in.
+  if (p === '/api/analytics/ingest' && req.method === 'POST') {
+    return readBody(req, res, (body) => withStore(() => {
+      let data;
+      try { data = JSON.parse(body || '{}'); } catch { return sendJson(res, 400, { error: 'Invalid JSON' }); }
+      const provider = String(data.provider || '').trim();
+      const metric = String(data.metric || '').trim();
+      const points = Array.isArray(data.points) ? data.points : (data.value !== undefined && data.day ? [{ day: data.day, value: data.value }] : []);
+      if (!provider || !metric || !points.length) {
+        return sendJson(res, 400, { error: 'provider, metric and points[] are required' });
+      }
+      const n = store.putAnalyticsPoints(provider, metric, points, data.source || 'ingest');
+      return sendJson(res, 200, { ok: true, provider, metric, points: n });
+    }));
+  }
+
   // ---- Draft queue (review-before-send) ----
   if (req.method === 'GET' && p === '/api/drafts') {
     return sendJson(res, 200, { data: readDrafts() });
@@ -1021,5 +1352,5 @@ function safeJson(raw) {
 server.listen(PORT, () => {
   const brand = (CFG.brand && CFG.brand.productName) || 'Email Pad';
   console.log(`✓ ${brand} running on http://127.0.0.1:${PORT} (useCase=${CFG.useCase}, outreach=${OUTREACH_ENABLED ? 'on' : 'off'})`);
-  console.log('  POST /api/send | GET /api/config | GET /api/domains | GET /api/sent | GET /api/received | POST /api/webhook | GET /api/archive | GET/PUT/DELETE /api/drafts | POST /api/drafts/:id/send | GET/DELETE /api/replies | GET/POST/PATCH /api/leads | GET /api/emails | GET /api/stats');
+  console.log('  POST /api/send | GET /api/config | GET /api/domains | GET /api/sent | GET /api/received | POST /api/webhook | GET /api/archive | GET/PUT/DELETE /api/drafts | POST /api/drafts/:id/send | POST /api/drafts/:id/redraft | GET/DELETE /api/replies | GET/POST/PATCH /api/leads | GET /api/trackers/summary|events|refresh | GET /api/analytics/summary | POST /api/analytics/ingest | GET /api/emails | GET /api/stats');
 });

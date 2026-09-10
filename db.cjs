@@ -17,7 +17,7 @@ const path = require('path');
 let DatabaseSync = null;
 try { ({ DatabaseSync } = require('node:sqlite')); } catch { DatabaseSync = null; }
 
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 
 const SCHEMA = `
 -- ---------------------------------------------------------------- leads
@@ -183,6 +183,48 @@ SELECT COALESCE(NULLIF(reason, ''), 'unspecified') AS reason,
        MAX(created_at) AS last_at
 FROM redraft_notes GROUP BY 1 ORDER BY n DESC;
 
+
+-- ------------------------------------------- Resend tracking (the Trackers tab)
+-- One row per delivery/engagement event, from the Resend webhook or from
+-- polling the API. The dedupe column keeps a replayed webhook from double
+-- counting.
+CREATE TABLE IF NOT EXISTS tracker_events (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  resend_id   TEXT,                             -- Resend's email id
+  email_id    TEXT,                             -- our emails.id (draft id) when known
+  lead_id     TEXT,
+  type        TEXT NOT NULL,                    -- sent|delivered|delivery_delayed|opened|clicked|bounced|complained|failed|scheduled|canceled
+  occurred_at TEXT NOT NULL,
+  url         TEXT,                             -- clicked link
+  user_agent  TEXT,
+  ip          TEXT,
+  bounce_type TEXT,                             -- hard | soft | undetermined
+  subject     TEXT,
+  to_addr     TEXT,
+  source      TEXT NOT NULL DEFAULT 'webhook',  -- webhook | poll | manual
+  raw         TEXT,
+  dedupe      TEXT UNIQUE
+);
+CREATE INDEX IF NOT EXISTS idx_tracker_resend ON tracker_events(resend_id);
+CREATE INDEX IF NOT EXISTS idx_tracker_type   ON tracker_events(type, occurred_at);
+CREATE INDEX IF NOT EXISTS idx_tracker_at     ON tracker_events(occurred_at);
+CREATE INDEX IF NOT EXISTS idx_tracker_lead   ON tracker_events(lead_id);
+
+CREATE VIEW IF NOT EXISTS v_tracker_daily AS
+SELECT substr(occurred_at, 1, 10) AS day, type, COUNT(*) AS n
+FROM tracker_events GROUP BY day, type;
+
+-- Points pushed in by an external tool (an MCP client, a script) when the
+-- provider's own API is not reachable from here. Keyed so a re-push updates.
+CREATE TABLE IF NOT EXISTS analytics_points (
+  provider   TEXT NOT NULL,                     -- ga4 | posthog | mcp
+  metric     TEXT NOT NULL,                     -- sessions | pageviews | users | conversions | events
+  day        TEXT NOT NULL,
+  value      REAL NOT NULL DEFAULT 0,
+  source     TEXT NOT NULL DEFAULT 'ingest',
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (provider, metric, day)
+);
 
 -- ------------------------------------------------------------ bookkeeping
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
@@ -776,6 +818,184 @@ class Store {
     const lead = this.get('SELECT * FROM leads WHERE id = ?', String(id));
     if (!lead) return null;
     return { lead, activity: this.activity(id) };
+  }
+
+  // ---------------------------------------------------- Resend tracking
+  /**
+   * Record one tracking event. Idempotent on (resend_id, type, occurred_at, url),
+   * so a webhook replay or a repeated poll cannot inflate the dashboard.
+   */
+  trackEvent(ev = {}) {
+    const type = String(ev.type || '').trim().toLowerCase();
+    if (!type) return { stored: false, reason: 'no type' };
+    const resendId = ev.resend_id || ev.resendId || null;
+    const occurredAt = ev.occurred_at || ev.occurredAt || nowIso();
+    const url = ev.url || null;
+    const dedupe = [resendId || '-', type, occurredAt, url || '-'].join('|');
+    const exists = this.get('SELECT 1 AS x FROM tracker_events WHERE dedupe = ?', dedupe);
+    if (exists) return { stored: false, reason: 'duplicate', dedupe };
+
+    // Link back to our own records when we can: the send row by Resend id, and
+    // the lead either from that send or from the recipient address.
+    const mail = resendId ? this.get('SELECT id, lead_id, subject, to_addr FROM emails WHERE resend_id = ?', resendId) : null;
+    const leadId = ev.lead_id || (mail && mail.lead_id) || null;
+    this.run(`INSERT INTO tracker_events (resend_id, email_id, lead_id, type, occurred_at, url, user_agent,
+                ip, bounce_type, subject, to_addr, source, raw, dedupe)
+              VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      resendId, ev.email_id || (mail && mail.id) || null, leadId, type, occurredAt, url,
+      ev.user_agent || null, ev.ip || null, ev.bounce_type || null,
+      ev.subject || (mail && mail.subject) || null, ev.to_addr || (mail && mail.to_addr) || null,
+      ev.source || 'webhook', ev.raw ? JSON.stringify(ev.raw) : null, dedupe);
+
+    // Keep the send row's status current: it is what the Sent list and the lead
+    // cards read, so the dashboard and the rest of the pad cannot disagree.
+    if (resendId && ['delivered', 'bounced', 'complained', 'delivery_delayed', 'failed', 'sent', 'opened', 'clicked', 'scheduled', 'canceled'].includes(type)) {
+      const rank = { sent: 1, scheduled: 1, delivered: 2, opened: 3, clicked: 4, bounced: 5, complained: 5, delivery_delayed: 2, failed: 5, canceled: 0 };
+      const row = this.get('SELECT status FROM emails WHERE resend_id = ?', resendId);
+      const current = (row && row.status) || '';
+      if (!current || (rank[type] || 0) >= (rank[current] || 0)) {
+        this.run('UPDATE emails SET status = ?, status_at = ?, updated_at = ? WHERE resend_id = ?',
+          type, occurredAt, nowIso(), resendId);
+      }
+    }
+    this.event('email', resendId || 'tracker', 'tracker.' + type, { leadId, type, url, resendId });
+    return { stored: true, type, leadId };
+  }
+
+  /** Everything the Trackers dashboard needs, in one round trip. */
+  trackerSummary({ days = 30 } = {}) {
+    const since = new Date(Date.now() - days * 86400000).toISOString();
+    const rows = this.all(`SELECT substr(occurred_at, 1, 10) AS day, type, COUNT(*) AS n
+                           FROM tracker_events WHERE occurred_at >= ? GROUP BY day, type ORDER BY day`, since);
+    const types = ['sent', 'delivered', 'delivery_delayed', 'opened', 'clicked', 'bounced', 'complained', 'failed', 'scheduled', 'canceled'];
+    const series = [];
+    const byDay = new Map();
+    for (let i = days - 1; i >= 0; i -= 1) {
+      const day = new Date(Date.now() - i * 86400000).toISOString().slice(0, 10);
+      const row = { day };
+      for (const ty of types) row[ty] = 0;
+      byDay.set(day, row);
+      series.push(row);
+    }
+    for (const r of rows) {
+      const row = byDay.get(r.day);
+      if (row) row[r.type] = (row[r.type] || 0) + r.n;
+    }
+    const totals = {};
+    for (const ty of types) totals[ty] = 0;
+    for (const r of this.all(`SELECT type, COUNT(*) AS n FROM tracker_events WHERE occurred_at >= ? GROUP BY type`, since)) {
+      totals[r.type] = r.n;
+    }
+    // Unique-by-send counts, which is what the rates should use.
+    const uniq = this.get(`SELECT COUNT(DISTINCT resend_id) AS n FROM tracker_events WHERE type = 'delivered' AND occurred_at >= ?`, since) || {};
+    const sends = this.get(`SELECT COUNT(DISTINCT resend_id) AS n FROM tracker_events WHERE occurred_at >= ?`, since) || {};
+    const pct = (a, b) => (b ? Math.round((a / b) * 1000) / 10 : 0);
+    const base = uniq.n || sends.n || 0;
+    const rates = {
+      delivery: pct(totals.delivered, sends.n || totals.sent || base),
+      open: pct(totals.opened, base),
+      click: pct(totals.clicked, base),
+      click_to_open: pct(totals.clicked, totals.opened),
+      bounce: pct(totals.bounced, sends.n || base),
+      complaint: pct(totals.complained, base),
+    };
+    return {
+      days,
+      since,
+      types,
+      totals,
+      unique_delivered: uniq.n || 0,
+      sends_tracked: sends.n || 0,
+      rates,
+      series,
+      funnel: [
+        { step: 'tracked sends', n: sends.n || 0 },
+        { step: 'delivered', n: uniq.n || 0 },
+        { step: 'opened', n: this.get(`SELECT COUNT(DISTINCT resend_id) AS n FROM tracker_events WHERE type = 'opened' AND occurred_at >= ?`, since).n || 0 },
+        { step: 'clicked', n: this.get(`SELECT COUNT(DISTINCT resend_id) AS n FROM tracker_events WHERE type = 'clicked' AND occurred_at >= ?`, since).n || 0 },
+        { step: 'replied', n: this.get('SELECT COUNT(DISTINCT resend_id) AS n FROM tracker_events WHERE type = \'replied\' AND occurred_at >= ?', since).n || 0 },
+      ],
+      top_links: this.all(`SELECT url, COUNT(*) AS clicks, COUNT(DISTINCT resend_id) AS senders
+                           FROM tracker_events WHERE type = 'clicked' AND url IS NOT NULL AND occurred_at >= ?
+                           GROUP BY url ORDER BY clicks DESC LIMIT 10`, since),
+      top_leads: this.all(`SELECT t.lead_id AS lead_id, COALESCE(l.company, l.email, t.to_addr) AS who,
+                                  COUNT(*) AS events,
+                                  SUM(CASE WHEN t.type = 'opened' THEN 1 ELSE 0 END) AS opens,
+                                  SUM(CASE WHEN t.type = 'clicked' THEN 1 ELSE 0 END) AS clicks
+                           FROM tracker_events t LEFT JOIN leads l ON l.id = t.lead_id
+                           WHERE t.lead_id IS NOT NULL AND t.occurred_at >= ?
+                           GROUP BY t.lead_id ORDER BY (opens + clicks) DESC, events DESC LIMIT 10`, since),
+      by_source: this.all(`SELECT source, COUNT(*) AS n FROM tracker_events WHERE occurred_at >= ? GROUP BY source ORDER BY n DESC`, since),
+      recent: this.all(`SELECT resend_id, type, occurred_at, url, subject, to_addr, bounce_type, source, lead_id
+                        FROM tracker_events ORDER BY occurred_at DESC LIMIT 40`),
+      last_event_at: (this.get('SELECT MAX(occurred_at) AS at FROM tracker_events') || {}).at || null,
+    };
+  }
+
+  trackerEvents({ limit = 100, type, resendId } = {}) {
+    const where = [];
+    const vals = [];
+    if (type) { where.push('type = ?'); vals.push(type); }
+    if (resendId) { where.push('resend_id = ?'); vals.push(resendId); }
+    return this.all(`SELECT * FROM tracker_events ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+                     ORDER BY occurred_at DESC LIMIT ?`, ...vals, limit);
+  }
+
+  trackerTimeline(resendId) {
+    const send = this.get('SELECT id, lead_id, subject, to_addr, status, sent_at, resend_id FROM emails WHERE resend_id = ?', resendId)
+      || this.get('SELECT id, lead_id, subject, to_addr, status, sent_at, resend_id FROM emails WHERE id = ?', resendId);
+    return {
+      send: send || null,
+      events: this.all('SELECT type, occurred_at, url, bounce_type, source FROM tracker_events WHERE resend_id = ? ORDER BY occurred_at', resendId),
+    };
+  }
+
+  // --------------------------------------------- analytics points (GA4/PostHog)
+  /** Upsert one metric series pushed in by an API fetch or an MCP client. */
+  putAnalyticsPoints(provider, metric, points = [], source = 'api') {
+    const ts = nowIso();
+    let n = 0;
+    for (const point of points) {
+      if (!point || !point.day) continue;
+      this.run(`INSERT INTO analytics_points (provider, metric, day, value, source, updated_at)
+                VALUES (?,?,?,?,?,?)
+                ON CONFLICT(provider, metric, day) DO UPDATE SET value = excluded.value,
+                  source = excluded.source, updated_at = excluded.updated_at`,
+        provider, metric, String(point.day).slice(0, 10), Number(point.value) || 0, source, ts);
+      n += 1;
+    }
+    return n;
+  }
+
+  /** Stored points for a provider, grouped by metric, newest day last. */
+  analyticsPoints(provider, { days = 30, metrics = ['sessions', 'pageviews', 'users', 'conversions', 'events'] } = {}) {
+    const since = new Date(Date.now() - days * 86400000).toISOString().slice(0, 10);
+    const out = { provider, metrics: {}, days: [], updated_at: null };
+    for (let i = days - 1; i >= 0; i -= 1) out.days.push(new Date(Date.now() - i * 86400000).toISOString().slice(0, 10));
+    for (const metric of metrics) {
+      const rows = this.all('SELECT day, value FROM analytics_points WHERE provider = ? AND metric = ? AND day >= ? ORDER BY day',
+        provider, metric, since);
+      if (rows.length) out.metrics[metric] = rows;
+    }
+    const last = this.get('SELECT MAX(updated_at) AS at FROM analytics_points WHERE provider = ?', provider);
+    out.updated_at = (last && last.at) || null;
+    return out;
+  }
+
+  /** Every point pushed in from outside (source != 'api'), grouped per provider. */
+  analyticsIngested({ days = 30 } = {}) {
+    const since = new Date(Date.now() - days * 86400000).toISOString().slice(0, 10);
+    const rows = this.all(`SELECT provider, metric, day, value, source FROM analytics_points
+                           WHERE source != 'api' AND day >= ? ORDER BY provider, metric, day`, since);
+    const metrics = {};
+    const providers = new Set();
+    for (const r of rows) {
+      providers.add(r.provider);
+      const key = `${r.provider}.${r.metric}`;
+      (metrics[key] = metrics[key] || []).push({ day: r.day, value: r.value });
+    }
+    const last = this.get("SELECT MAX(updated_at) AS at FROM analytics_points WHERE source != 'api'");
+    return { providers: [...providers], metrics, updated_at: (last && last.at) || null, points: rows.length };
   }
 
   // ----------------------------------------------- one-time legacy import

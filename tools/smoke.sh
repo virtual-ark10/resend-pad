@@ -98,5 +98,34 @@ echo "10. reply soft-delete hides it"
 curl -s -m 5 -X DELETE -H "$H" "http://127.0.0.1:$PAD_PORT/api/replies/smoke-reply" > /dev/null
 get "http://127.0.0.1:$PAD_PORT/api/replies" | jget "len(d['data'])" | grep -q "^0$" || fail "reply delete"
 
+echo "11. tracker events land and stay deduped"
+node -e "
+const db=require('$ROOT/db.cjs'); const s=db.open('$T/data');
+s.recordSend({id:'smoke-send', resendId:'re_smoke_1', to:'owner@smoke.invalid', subject:'Smoke', text:'x', status:'sent'});
+const at = '2026-01-05T10:00:00.000Z';
+s.trackEvent({type:'delivered', resend_id:'re_smoke_1', occurred_at:at, source:'poll'});
+s.trackEvent({type:'opened',    resend_id:'re_smoke_1', occurred_at:at});
+s.trackEvent({type:'clicked',   resend_id:'re_smoke_1', occurred_at:at, url:'https://example.invalid/x'});
+// same event again: a replayed webhook must not be counted twice
+console.log('replay ->', JSON.stringify(s.trackEvent({type:'opened', resend_id:'re_smoke_1', occurred_at:at})));
+" || fail "tracker events"
+get "http://127.0.0.1:$PAD_PORT/api/trackers/summary?days=400" | jget "d['totals']['opened']" | grep -q "^1$" || fail "dedupe (opened counted twice)"
+get "http://127.0.0.1:$PAD_PORT/api/trackers/events?limit=50" | jget "sum(1 for e in d['data'] if e['type']=='opened')" | grep -q "^1$" || fail "replayed event stored twice"
+get "http://127.0.0.1:$PAD_PORT/api/trackers/summary?days=400" | jget "d['rates']['click']" | grep -q "^100" || fail "click rate"
+get "http://127.0.0.1:$PAD_PORT/api/trackers/summary?days=400" | jget "len(d['top_links'])" | grep -q "^1$" || fail "top links"
+get "http://127.0.0.1:$PAD_PORT/api/trackers/email/re_smoke_1" | jget "len(d['events'])" | grep -q "^3$" || fail "per-send timeline"
+get "http://127.0.0.1:$PAD_PORT/api/trackers/summary?days=400" | jget "d['totals']['delivered']" | grep -q "^1$" || fail "delivered"
+echo "12. tracking settings are reported (so the UI can warn)"
+get "http://127.0.0.1:$PAD_PORT/api/trackers/summary?days=400" | jget "sorted(d['tracking'].keys())" | grep -q "openTracking" || fail "tracking flags"
+echo "13. analytics providers answer without keys, and never fake data"
+get "http://127.0.0.1:$PAD_PORT/api/analytics/summary?days=7" | jget "[p['id'] for p in d['providers']]" | grep -q "posthog" || fail "providers"
+get "http://127.0.0.1:$PAD_PORT/api/analytics/summary?days=7" | jget "sum(1 for p in d['providers'] if p.get('error'))" | grep -q "^2$" || fail "unconfigured providers should say what they need"
+echo "14. an MCP client can push points in"
+TODAY=$(date -u +%F)
+curl -s -m 5 -X POST -H "$H" -H 'content-type: application/json' \
+  -d "{\"provider\":\"posthog\",\"metric\":\"pageviews\",\"points\":[{\"day\":\"$TODAY\",\"value\":9}]}" \
+  "http://127.0.0.1:$PAD_PORT/api/analytics/ingest" | jget "d['ok']" | grep -q "True" || fail "ingest"
+get "http://127.0.0.1:$PAD_PORT/api/analytics/summary?days=7" | jget "[p['id'] for p in d['providers'] if p['configured']]" | grep -q "mcp" || fail "pushed points visible"
+
 echo
-echo "OK: pad + engine + the event loop behave."
+echo "OK: pad + engine + the event loop + trackers + analytics behave."

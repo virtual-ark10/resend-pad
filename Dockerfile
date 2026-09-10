@@ -14,6 +14,7 @@ WORKDIR /app
 
 COPY package.json server.cjs db.cjs hooks.cjs index.html outreach-links.cjs ./
 COPY leads/ ./leads/
+COPY vendor/ ./vendor/
 
 # DATA_DIR holds drafts.json, sent-drafts.jsonl and webhooks.jsonl. Created and
 # chowned here so a fresh named volume inherits the right ownership.
