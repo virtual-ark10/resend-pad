@@ -67,14 +67,24 @@
   ],
   "templates": {
     "intro": {
-      "label": "Intro (first contact)",
-      "subject": "{{company}} × {{product}} — quick idea",
-      "body": "<p>Hi {{first_name}},</p><p>I work on <strong>{{product}}</strong> and wanted to reach out about {{company}}.</p><p>Would you be open to a short note on what we do?</p>{{signature}}"
+      "label": "Intro - quick wins + one tease",
+      "subject": "{{company}} is just outside the top 5 in {{metro}}",
+      "body": "<p>Hi {{first_name}},</p><p>I looked at {{metro}} search results for {{service}} and {{company}} came up around #{{position}}. Nothing exotic is beating you: two things on the page are doing the damage, and both are fixable this week.</p><p><strong>1. {{quick_win_1}}</strong><br>{{quick_win_1_cost}}</p><p><strong>2. {{quick_win_2}}</strong><br>{{quick_win_2_cost}}</p><p>Two things I left out of this email, because they need a walk-through rather than a bullet. The first is the one I would fix after the items above: {{medium_tease}}. The second is bigger, and it is where this is heading: {{high_tease}}.</p><p>We're a boutique Local SEO agency that's worked with garage door and home-service companies to move pages like this from page one's back half into the top 5. Want the full 10-minute audit?</p>{{signature}}"
     },
     "fu1": {
-      "label": "Follow-up 1 (3–5 days)",
-      "subject": "Re: {{company}} × {{product}} — quick idea",
-      "body": "<p>Hi {{first_name}},</p><p>Just floating this back up — making sure my last note did not get buried.</p>{{signature}}"
+      "label": "Follow-up 1 - reveal the next tier, keep one thing back",
+      "subject": "Re: {{company}} - the two things I held back",
+      "body": "<p>Hi {{first_name}},</p><p>Following up with the part of the audit I did not put in the first email.</p><p><strong>{{medium_finding_1}}</strong><br>{{medium_finding_1_cost}}</p><p><strong>{{medium_finding_2}}</strong><br>{{medium_finding_2_cost}}</p><p>There is still one thing I have not put in writing, because it is the bigger of the two: {{high_tease}}. That one changes the picture more than everything above it, and it needs a conversation rather than a bullet.</p><p>Want me to walk you through it?</p>{{signature}}"
+    },
+    "fu2": {
+      "label": "Follow-up 2 - the big one, briefly",
+      "subject": "Re: {{company}} - the item I kept leaving out",
+      "body": "<p>Hi {{first_name}},</p><p>One more, and it is the one I have been holding back. {{high_finding}}</p><p>{{high_finding_cost}}</p><p>It is the reason the pages above you can keep outranking a page your size, and it is the part of the audit I would rather show you than describe.</p><p>Reply with the word audit and I will send the write-up for {{company}}.</p>{{signature}}"
+    },
+    "fu3": {
+      "label": "Follow-up 3 - closing the file",
+      "subject": "Re: {{company}} - closing the file",
+      "body": "<p>Hi {{first_name}},</p><p>Last note from me, and I will stop here so I am not cluttering your inbox. If the {{metro}} ranking is something you want to revisit later, reply with the word audit and I will pull it back up.</p>{{signature}}"
     }
   },
   "tracking": {
@@ -198,5 +208,6 @@
       "apiKey": "",
       "event": "$pageview"
     }
-  }
+  },
+  "_templates_readme": "The draft architecture: email 1 shows 2-3 quick wins with what each costs, then one curiosity paragraph that out-weighs them, then the agency line. Follow-ups reveal one tier at a time (medium, then high) and always keep one thing open. Slots the pipeline fills: company, first_name, metro, service, position, quick_win_N, quick_win_N_cost, medium_finding_N, medium_finding_N_cost, medium_tease, high_finding, high_finding_cost, high_tease. Tier definitions: the seo-local and seo-geo skills."
 }
