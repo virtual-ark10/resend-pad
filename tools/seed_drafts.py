@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
-"""Seed the pad's draft queue (data/drafts.json) from a CSV or JSON list.
+"""Seed the pad's draft queue from a CSV or JSON list.
+
+Posts to the pad's API (POST /api/drafts) so drafts land in the SQLite queue the
+pad actually reads; that endpoint upserts, so re-running after a fresh audit
+appends only new drafts and refreshes changed ones.
+
+  python3 tools/seed_drafts.py drafts.csv --raw-html --url http://127.0.0.1:3001 --token $PAD_TOKEN
+
+The legacy drafts.json path remains for an old pad (see the warning it prints).
 
 Safe by construction:
   * creates data/drafts.json if it does not exist
@@ -29,6 +37,10 @@ correctly in the pad's editor.
 """
 import argparse
 import csv
+import json
+import os
+import urllib.error
+import urllib.request
 import datetime
 import json
 import os
@@ -170,6 +182,12 @@ def main():
     ap.add_argument("--data-dir", default="", help="data dir; overrides the default drafts.json location")
     ap.add_argument("--raw-html", action="store_true", help="treat the html column as markup (do not escape it)")
     ap.add_argument("--dry-run", action="store_true", help="show what would happen, write nothing")
+    ap.add_argument("--url", default=os.environ.get("PAD_URL", ""),
+                    help="pad base URL (default $PAD_URL). When set with a token, drafts go "
+                         "through POST /api/drafts instead of the file")
+    ap.add_argument("--token", default=os.environ.get("PAD_TOKEN", ""), help="pad token (default $PAD_TOKEN)")
+    ap.add_argument("--file-only", action="store_true",
+                    help="force the legacy drafts.json path even when a URL is configured")
     args = ap.parse_args()
 
     drafts_path = os.path.join(args.data_dir, "drafts.json") if args.data_dir else args.drafts
@@ -178,6 +196,50 @@ def main():
     rows = load_rows(args.input)
     if not rows:
         sys.exit("no rows found in input")
+
+    api_mode = bool(args.url and args.token and not args.file_only)
+
+    if api_mode:
+        built, skipped_api = [], []
+        for i, row in enumerate(rows, start=1):
+            draft, err = build_draft(row, args.raw_html)
+            if draft is None:
+                skipped_api.append((i, err))
+                continue
+            built.append(draft)
+        print(f"input            : {args.input} ({len(rows)} row(s))")
+        print(f"target           : {args.url.rstrip('/')}/api/drafts (SQLite queue)")
+        print(f"to import        : {len(built)}")
+        for d in built:
+            print(f"   + {d['id']}  ->  {d['to'] or '(no recipient)'}  |  {d['subject'] or '(no subject)'}")
+        if skipped_api:
+            print(f"skipped          : {len(skipped_api)}")
+            for i, why in skipped_api:
+                print(f"   - row {i}: {why}")
+        if args.dry_run:
+            print("dry run - nothing posted")
+            return 0
+        if not built:
+            print("nothing to post")
+            return 0
+        body = json.dumps({"drafts": built}).encode("utf-8")
+        req = urllib.request.Request(
+            args.url.rstrip("/") + "/api/drafts", data=body, method="POST",
+            headers={"Content-Type": "application/json", "x-pad-token": args.token,
+                     "User-Agent": "seed-drafts/2.0"})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                out = json.loads(r.read().decode("utf-8", "ignore") or "{}")
+        except urllib.error.HTTPError as e:
+            sys.exit(f"pad refused the import: HTTP {e.code} {e.read().decode('utf-8', 'ignore')[:200]}")
+        except Exception as e:
+            sys.exit(f"could not reach the pad at {args.url}: {e}")
+        print(f"imported         : {out.get('added', 0)} new, {out.get('updated', 0)} refreshed")
+        print(f"queue now        : {out.get('queue_length', '?')} draft(s)")
+        return 0
+
+    if args.url and not args.token:
+        print("note: --url given without --token, falling back to the drafts.json file")
 
     existing = read_existing(drafts_path)
     seen = {str(d.get("id")) for d in existing if isinstance(d, dict)}
@@ -216,6 +278,9 @@ def main():
     final = fresh + [d for d in appended if d["id"] not in fresh_ids]
     write_atomic(drafts_path, final)
     print(f"wrote {len(final)} draft(s) to {drafts_path}")
+    print("WARNING: this pad reads its queue from SQLite (data/pad.db). A file write only "
+          "reaches a pad old enough to still import drafts.json. Set PAD_URL and PAD_TOKEN "
+          "(or --url/--token) to post to POST /api/drafts instead.")
     return 0
 
 

@@ -1242,6 +1242,24 @@ function handleApi(req, res, url, ip) {
     }));
   }
 
+  // Bulk import for the drafting pipeline: POST a JSON array, or {drafts:[...]}.
+  // Upserts only, so importing a batch never discards drafts already queued.
+  if (store && p === '/api/drafts' && req.method === 'POST') {
+    return readBody(req, res, (body) => withStore(() => {
+      let data;
+      try { data = JSON.parse(body || '{}'); } catch { return sendJson(res, 400, { error: 'Invalid JSON' }); }
+      const list = Array.isArray(data) ? data : (Array.isArray(data.drafts) ? data.drafts : null);
+      if (!list) return sendJson(res, 400, { error: 'send a JSON array, or {drafts:[...]}' });
+      const out = store.upsertDrafts(list, { source: 'import' });
+      if (rules) store.processEvents(rules);
+      console.log(`[DRAFTS] imported ${out.added.length} new, refreshed ${out.updated.length}`);
+      return sendJson(res, 200, {
+        ok: true, added: out.added.length, updated: out.updated.length,
+        added_ids: out.added, updated_ids: out.updated, queue_length: store.listDrafts().length,
+      });
+    }));
+  }
+
   // ---- Draft queue (review-before-send) ----
   if (req.method === 'GET' && p === '/api/drafts') {
     return sendJson(res, 200, { data: readDrafts() });

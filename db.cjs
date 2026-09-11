@@ -534,6 +534,41 @@ class Store {
     }
   }
 
+  /**
+   * Bulk upsert for the drafting pipeline: adds or refreshes drafts and never
+   * marks anything else as discarded, so a partial import cannot lose the queue.
+   */
+  upsertDrafts(list, { source = 'import' } = {}) {
+    const added = [];
+    const updated = [];
+    for (const d of Array.isArray(list) ? list : []) {
+      const id = String(d.id || '').trim();
+      if (!id) continue;
+      const leadId = this.upsertLead({ email: d.to || d.to_addr, company: d.company, source: 'outreach' });
+      const ts = nowIso();
+      const vals = [leadId, d.company || null, d.from || d.from_addr || null, d.to || d.to_addr || null,
+        d.cc || d.cc_addr || null, d.subject || null, d.reply_to || null, d.in_reply_to || null,
+        d.text || d.body_text || null, d.html || d.body_html || null,
+        d.attachments ? JSON.stringify(d.attachments) : null,
+        d.headers ? JSON.stringify(d.headers) : null, ts];
+      const exists = this.get('SELECT id FROM drafts WHERE id = ?', id);
+      if (exists) {
+        this.run(`UPDATE drafts SET lead_id = ?, company = ?, from_addr = ?, to_addr = ?, cc_addr = ?,
+                  subject = ?, reply_to = ?, in_reply_to = ?, body_text = ?, body_html = ?,
+                  attachments = ?, headers = ?, updated_at = ?, status = 'draft' WHERE id = ?`, ...vals, id);
+        updated.push(id);
+      } else {
+        this.run(`INSERT INTO drafts (lead_id, company, from_addr, to_addr, cc_addr, subject, reply_to,
+                  in_reply_to, body_text, body_html, attachments, headers, updated_at, id, created_at, status)
+                  VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'draft')`, ...vals, id, ts);
+        added.push(id);
+      }
+      this.event('draft', id, 'draft.created', { leadId, draftId: id, to: d.to || d.to_addr,
+        subject: d.subject || '', source });
+    }
+    return { added, updated };
+  }
+
   deleteDraft(id) {
     const d = this.getDraft(id);
     if (!d) return false;
