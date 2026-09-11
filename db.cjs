@@ -17,7 +17,7 @@ const path = require('path');
 let DatabaseSync = null;
 try { ({ DatabaseSync } = require('node:sqlite')); } catch { DatabaseSync = null; }
 
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 
 const SCHEMA = `
 -- ---------------------------------------------------------------- leads
@@ -161,10 +161,17 @@ CREATE TABLE IF NOT EXISTS events (
   payload    TEXT,                             -- JSON
   at         TEXT NOT NULL,
   actor      TEXT,
-  processed_at TEXT                            -- NULL until the rules engine ran it
+  processed_at TEXT,                           -- NULL until the rules engine ran it
+  attempts     INTEGER NOT NULL DEFAULT 0,     -- failed rule runs; dead-lettered at maxAttempts
+  last_error   TEXT                            -- last rule failure, kept when dead-lettered
 );
 CREATE INDEX IF NOT EXISTS idx_events_entity ON events(entity, entity_id, at);
 CREATE INDEX IF NOT EXISTS idx_events_unprocessed ON events(processed_at, id);
+
+-- What is still queued, and why it is still there.
+CREATE VIEW IF NOT EXISTS v_events_pending AS
+SELECT id, entity, entity_id, type, payload, at, attempts, last_error
+FROM events WHERE processed_at IS NULL ORDER BY id;
 
 -- --------------------------------------------- why a draft was sent back
 CREATE TABLE IF NOT EXISTS redraft_notes (
@@ -204,6 +211,89 @@ SELECT lead_id, at, kind, detail FROM (
   UNION ALL
   SELECT lead_id, changed_at, 'stage_change', from_stage || ' -> ' || to_stage FROM lead_stage_events
 ) ORDER BY at DESC;
+
+-- ---------------------------------------------------------------- engagement
+-- Opens and clicks as Resend reports them: ONE ROW PER EVENT, never a counter on
+-- its own, so a wrong number can always be traced back to the event behind it.
+-- Resend's payload carries no event id, so dedupe is derived from the parts a
+-- retry repeats verbatim; the unique index turns a duplicate delivery into a
+-- no-op.
+--
+-- Deliberately separate from emails.status: an open is NOT a delivery state, and
+-- letting one overwrite 'delivered' would collapse the funnel and let a bounced
+-- message look opened. This table records what the provider already did; it
+-- never moves a stage.
+CREATE TABLE IF NOT EXISTS email_engagements (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  resend_id  TEXT,                                  -- emails.resend_id (may not be matched)
+  email_id   TEXT REFERENCES emails(id) ON DELETE SET NULL,
+  lead_id    TEXT REFERENCES leads(id) ON DELETE SET NULL,
+  kind       TEXT NOT NULL,                         -- open | click
+  url        TEXT,                                  -- the clicked link; NULL for opens
+  link_host  TEXT,                                  -- hostname, for grouping links
+  user_agent TEXT,
+  ip         TEXT,
+  at         TEXT NOT NULL,                         -- when it happened (provider time)
+  dedupe     TEXT,
+  created_at TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_eng_dedupe ON email_engagements(dedupe) WHERE dedupe IS NOT NULL;
+CREATE INDEX IF NOT EXISTS ix_eng_resend ON email_engagements(resend_id);
+CREATE INDEX IF NOT EXISTS ix_eng_lead   ON email_engagements(lead_id, at);
+CREATE INDEX IF NOT EXISTS ix_eng_kind   ON email_engagements(kind, at);
+CREATE INDEX IF NOT EXISTS ix_eng_host   ON email_engagements(kind, link_host);
+
+-- The questions the Tracking tab asks, answered from the rows themselves.
+DROP VIEW IF EXISTS v_engagement_daily;
+CREATE VIEW v_engagement_daily AS
+SELECT substr(at, 1, 10) AS day,
+       kind,
+       COUNT(*)                  AS n,
+       COUNT(DISTINCT resend_id) AS messages,
+       COUNT(DISTINCT lead_id)   AS leads
+FROM email_engagements
+GROUP BY day, kind;
+
+DROP VIEW IF EXISTS v_top_links;
+CREATE VIEW v_top_links AS
+SELECT COALESCE(link_host, '(unknown)') AS host,
+       url,
+       COUNT(*)                AS clicks,
+       COUNT(DISTINCT lead_id) AS leads,
+       MIN(at)                 AS first_at,
+       MAX(at)                 AS last_at
+FROM email_engagements
+WHERE kind = 'click'
+GROUP BY url
+ORDER BY clicks DESC;
+
+DROP VIEW IF EXISTS v_engagement_by_lead;
+CREATE VIEW v_engagement_by_lead AS
+SELECT lead_id,
+       SUM(CASE WHEN kind = 'open'  THEN 1 ELSE 0 END) AS opens,
+       SUM(CASE WHEN kind = 'click' THEN 1 ELSE 0 END) AS email_clicks,
+       MIN(CASE WHEN kind = 'open'  THEN at END)       AS first_open_at,
+       MAX(CASE WHEN kind = 'open'  THEN at END)       AS last_open_at,
+       MIN(CASE WHEN kind = 'click' THEN at END)       AS first_click_at,
+       MAX(CASE WHEN kind = 'click' THEN at END)       AS last_click_at
+FROM email_engagements
+WHERE lead_id IS NOT NULL
+GROUP BY lead_id;
+
+-- Per message: what the Sent tab shows beside a mail ("opened 3x, clicked once").
+DROP VIEW IF EXISTS v_email_engagement;
+CREATE VIEW v_email_engagement AS
+SELECT resend_id,
+       SUM(CASE WHEN kind = 'open'  THEN 1 ELSE 0 END) AS opens,
+       SUM(CASE WHEN kind = 'click' THEN 1 ELSE 0 END) AS clicks,
+       MIN(CASE WHEN kind = 'open'  THEN at END)       AS first_open_at,
+       MAX(CASE WHEN kind = 'open'  THEN at END)       AS last_open_at,
+       MIN(CASE WHEN kind = 'click' THEN at END)       AS first_click_at,
+       MAX(CASE WHEN kind = 'click' THEN at END)       AS last_click_at
+FROM email_engagements
+WHERE resend_id IS NOT NULL
+GROUP BY resend_id;
 `;
 
 const nowIso = () => new Date().toISOString();
@@ -262,6 +352,8 @@ function open(dataDir, opts = {}) {
     if (!exists) return;
     const cols = db.prepare('PRAGMA table_info(events)').all().map((c) => c.name);
     if (!cols.includes('processed_at')) db.exec('ALTER TABLE events ADD COLUMN processed_at TEXT');
+    if (!cols.includes('attempts')) db.exec('ALTER TABLE events ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0');
+    if (!cols.includes('last_error')) db.exec('ALTER TABLE events ADD COLUMN last_error TEXT');
   });
   withRetry('schema', () => db.exec(SCHEMA));
   // Upsert: an existing store reports the version this build actually creates,
@@ -342,6 +434,104 @@ class Store {
       this.run('INSERT INTO events(entity, entity_id, type, payload, at) VALUES (?,?,?,?,?)',
         entity, entityId == null ? null : String(entityId), type, payload ? JSON.stringify(payload) : null, nowIso());
     } catch (err) { console.warn('[DB] event log failed:', err.message); }
+  }
+
+  // ------------------------------------------------------------- failures
+  /** A failure is a first-class event, not just a log line: anything that throws
+   *  or comes back non-2xx on the way to real work writes a type='error' row, so
+   *  failures land in the same stream as successes (countable, chartable, and
+   *  visible next to the lead they concern). payload.op names WHICH operation
+   *  failed, so one type stays easy to aggregate.
+   *  It must never throw — recording a failure must not create one. */
+  logFailure({ entity = 'system', entity_id = null, op, error = null, status = null, actor = null, at = null, extra = null } = {}) {
+    const message = String((error && error.message) || error || 'unknown error');
+    let payload;
+    try {
+      payload = JSON.stringify(Object.assign(
+        { op: op || 'unknown', message: message.slice(0, 900), status: status == null ? null : status }, extra || {}));
+    } catch (e) {
+      payload = JSON.stringify({ op: op || 'unknown', message: message.slice(0, 900) });
+    }
+    try {
+      return this.run('INSERT INTO events(entity, entity_id, type, payload, at, actor) VALUES (?,?,?,?,?,?)',
+        entity, entity_id == null ? null : String(entity_id), 'error', payload, at || nowIso(), actor || null);
+    } catch (e) {
+      try { console.error('[DB] could not record a failure event:', e && e.message); } catch (_) { /* nothing left */ }
+      return null;
+    }
+  }
+
+  // ----------------------------------------------------------- engagement
+  /** An open or click Resend reported. This records something that ALREADY
+   *  happened at the provider, so it never moves a stage and never writes
+   *  emails.status — a second writer of either is exactly what collapses the
+   *  funnel. `dedupe` collapses a webhook retry into one row (Resend sends no
+   *  event id, so the caller derives a key from the payload's stable parts). */
+  recordEngagement({ resend_id, kind, url = null, user_agent = null, ip = null, at = null, dedupe = null } = {}) {
+    if (!resend_id || !kind) return { inserted: 0, reason: 'resend_id and kind are required' };
+    const when = at || nowIso();
+    const mail = this.get('SELECT id, lead_id FROM emails WHERE resend_id = ?', resend_id);
+    let host = null;
+    try { host = url ? new URL(url).host.toLowerCase() : null; } catch (e) { host = null; }
+    const key = dedupe || [kind, resend_id, url || '', when].join('|');
+    const ins = this.run(`INSERT OR IGNORE INTO email_engagements
+        (resend_id, email_id, lead_id, kind, url, link_host, user_agent, ip, at, dedupe, created_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+      resend_id, mail ? mail.id : null, mail ? mail.lead_id : null, kind, url, host,
+      user_agent ? String(user_agent).slice(0, 400) : null, ip || null, when, key, nowIso());
+    const changes = Number(ins && ins.changes || 0);
+    return {
+      inserted: changes,
+      duplicate: !changes,
+      matched: Boolean(mail),
+      email_id: mail ? mail.id : null,
+      lead_id: mail ? mail.lead_id : null,
+      kind,
+      url,
+    };
+  }
+
+  /** Counters are always derived from the rows, so they can be rebuilt and can
+   *  never drift from the events that produced them. */
+  engagementTotals(sinceISO) {
+    return this.get(
+      `SELECT COUNT(*)                                                    AS events,
+              COALESCE(SUM(CASE WHEN kind = 'open'  THEN 1 ELSE 0 END),0) AS opens,
+              COALESCE(SUM(CASE WHEN kind = 'click' THEN 1 ELSE 0 END),0) AS email_clicks,
+              COUNT(DISTINCT CASE WHEN kind = 'open'  THEN resend_id END) AS opened_messages,
+              COUNT(DISTINCT CASE WHEN kind = 'click' THEN resend_id END) AS clicked_messages,
+              COUNT(DISTINCT CASE WHEN kind = 'open'  THEN lead_id END)   AS opened_leads,
+              COUNT(DISTINCT CASE WHEN kind = 'click' THEN lead_id END)   AS clicked_leads
+         FROM email_engagements WHERE at >= ?`, sinceISO) || {};
+  }
+
+  engagementSeries(sinceISO) {
+    return this.all(
+      `SELECT substr(at, 1, 10) AS day,
+              SUM(CASE WHEN kind = 'open'  THEN 1 ELSE 0 END) AS opens,
+              SUM(CASE WHEN kind = 'click' THEN 1 ELSE 0 END) AS clicks
+         FROM email_engagements WHERE at >= ? GROUP BY day ORDER BY day`, sinceISO);
+  }
+
+  engagementByLead(sinceISO) {
+    return this.all(
+      `SELECT lead_id,
+              SUM(CASE WHEN kind = 'open'  THEN 1 ELSE 0 END) AS opens,
+              SUM(CASE WHEN kind = 'click' THEN 1 ELSE 0 END) AS email_clicks
+         FROM email_engagements WHERE at >= ? AND lead_id IS NOT NULL
+        GROUP BY lead_id`, sinceISO);
+  }
+
+  topLinks(sinceISO, limit = 10) {
+    return this.all(
+      `SELECT url, link_host AS host, COUNT(*) AS clicks, COUNT(DISTINCT lead_id) AS leads, MAX(at) AS last_at
+         FROM email_engagements
+        WHERE kind = 'click' AND at >= ? AND url IS NOT NULL
+        GROUP BY url ORDER BY clicks DESC, last_at DESC LIMIT ?`, sinceISO, limit);
+  }
+
+  engagementForLead(leadId) {
+    return this.get('SELECT * FROM v_engagement_by_lead WHERE lead_id = ?', leadId) || { opens: 0, email_clicks: 0 };
   }
 
   /** Create the lead if it is new, otherwise fill in blanks and touch it. */
@@ -708,10 +898,11 @@ class Store {
    * on every /api/meta + /api/sync, so an event fired by one process triggers
    * its next action in the other without a message bus.
    */
-  processEvents(rules, { limit = 500 } = {}) {
+  processEvents(rules, { limit = 500, maxAttempts = 5 } = {}) {
     if (!rules) return { processed: 0, actions: [] };
-    const rows = this.all(`SELECT id, entity, entity_id, type, payload, at FROM events
+    const rows = this.all(`SELECT id, entity, entity_id, type, payload, at, attempts FROM events
                            WHERE processed_at IS NULL ORDER BY id LIMIT ?`, limit);
+    if (!rows.length) return { processed: 0, actions: [] };
     const actions = [];
     // One short write transaction: the other process (pad/engine) may be writing
     // the same file, and a partially applied batch would be worse than a retry.
@@ -725,18 +916,31 @@ class Store {
       try {
         const out = rule ? rule({ event: row, payload, store: this }) : null;
         if (out) actions.push(Object.assign({ event: row.type }, out));
+        this.run('UPDATE events SET processed_at = ? WHERE id = ?', nowIso(), row.id);
       } catch (err) {
-        console.warn(`[EVENTS] rule for ${row.type} failed:`, err.message);
+        // A rule that keeps throwing must not stall the queue: count the attempt,
+        // keep the message, and after maxAttempts DEAD-LETTER the row (marked
+        // processed with the error kept, plus one type='error' event) so every
+        // event behind it still moves. A rule may fail, but it may not block.
+        const attempts = (Number(row.attempts) || 0) + 1;
+        const msg = String((err && err.message) || err).slice(0, 500);
+        if (attempts >= maxAttempts) {
+          this.run('UPDATE events SET processed_at = ?, attempts = ?, last_error = ? WHERE id = ?', nowIso(), attempts, msg, row.id);
+          this.logFailure({ entity: 'event', entity_id: String(row.id), op: 'rule_' + row.type, error: err,
+                            actor: 'hooks', extra: { event_id: row.id, attempts, dead_lettered: true } });
+          actions.push({ id: row.id, event: row.type, dead_lettered: true, attempts, error: msg });
+        } else {
+          this.run('UPDATE events SET attempts = ?, last_error = ? WHERE id = ?', attempts, msg, row.id);
+          actions.push({ id: row.id, event: row.type, retry: attempts, error: msg });
+        }
       }
-      this.run('UPDATE events SET processed_at = ? WHERE id = ?', nowIso(), row.id);
     }
     this.run('COMMIT');
     return { processed: rows.length, actions };
   }
 
   pendingEvents(limit = 200) {
-    return this.all(`SELECT id, entity, entity_id, type, payload, at FROM events
-                     WHERE processed_at IS NULL ORDER BY id LIMIT ?`, limit);
+    return this.all('SELECT id, entity, entity_id, type, payload, at, attempts, last_error FROM v_events_pending LIMIT ?', limit);
   }
 
   recentEvents({ limit = 100, leadId } = {}) {

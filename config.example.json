@@ -7,7 +7,9 @@
     "siteUrl": "https://acme.example",
     "logoInitials": "AL",
     "tagline": "Outbound + inbox · powered by Resend",
-    "accentColor": ""
+    "accentColor": "",
+    "_domains": "The domains this instance owns. Set this when the Resend account is shared with another brand: the webhook uses it to ignore events that are not yours. Omit it on a single-brand instance.",
+    "domains": []
   },
   "from": "Acme Labs <hello@acme.example>",
   "replyTo": "hello@acme.example",
@@ -45,6 +47,16 @@
     {
       "id": "received",
       "label": "Received",
+      "enabled": true
+    },
+    {
+      "id": "tracking",
+      "label": "Tracking",
+      "enabled": true
+    },
+    {
+      "id": "analytics",
+      "label": "Analytics",
       "enabled": true
     }
   ],

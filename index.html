@@ -272,6 +272,48 @@
     <div id="recv_list"></div>
   </section>
 
+
+  <!-- ================= TRACKING ================= -->
+  <!-- Two click numbers exist and they are NOT the same thing:
+       email_clicks is Resend's click tracking on the mail's own links;
+       clicks is the OPTIONAL first-party layer (tokenised links back to your
+       site). An instance without the optional layer shows "not tracked" there
+       instead of a zero that would read as a measurement. -->
+  <section class="panel" id="panel-tracking">
+    <h2 style="font-size:14px;margin:0 0 8px"><span id="lbl_tracking">Tracking</span>
+      <span class="count" id="trk_window"></span></h2>
+    <div id="trk_kpis" style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px"></div>
+    <div id="trk_charts_note" style="display:none;font-size:12px;opacity:.7;margin-bottom:8px">Charts unavailable — the numbers below are still complete.</div>
+    <div style="display:flex;flex-wrap:wrap;gap:12px;margin-bottom:14px">
+      <div style="flex:1 1 320px;min-width:280px"><div style="font-size:12px;opacity:.75;margin-bottom:4px">Engagement (opens / email clicks)</div><canvas id="trk_c_eng" height="140"></canvas></div>
+      <div style="flex:1 1 320px;min-width:280px"><div style="font-size:12px;opacity:.75;margin-bottom:4px">Mail volume (sent / delivered)</div><canvas id="trk_c_mail" height="140"></canvas></div>
+    </div>
+    <div style="display:flex;flex-wrap:wrap;gap:12px">
+      <div style="flex:1 1 320px;min-width:280px">
+        <div style="font-size:12px;opacity:.75;margin:6px 0 4px">Links that earned the clicks</div>
+        <div id="trk_links"></div>
+      </div>
+      <div style="flex:1 1 320px;min-width:280px">
+        <div style="font-size:12px;opacity:.75;margin:6px 0 4px">By lead</div>
+        <div id="trk_leads"></div>
+      </div>
+    </div>
+    <div style="font-size:12px;opacity:.75;margin:14px 0 4px">Failures (grouped by operation)</div>
+    <div id="trk_errors"></div>
+    <div style="font-size:12px;opacity:.75;margin:14px 0 4px">Where these numbers come from</div>
+    <div id="trk_provenance"></div>
+  </section>
+
+  <!-- ================= ANALYTICS ================= -->
+  <!-- Third-party analytics are listed as NOT connected on purpose: the numbers
+       are wired over MCP later. Nothing is faked to fill the space. -->
+  <section class="panel" id="panel-analytics">
+    <h2 style="font-size:14px;margin:0 0 8px"><span id="lbl_analytics">Analytics</span></h2>
+    <div id="an_table"></div>
+    <div style="font-size:12px;opacity:.75;margin:14px 0 4px">Mail status (all time)</div>
+    <div id="an_statuses"></div>
+  </section>
+
   <footer id="brand_footer">Self-contained client — no external assets, no build step.</footer>
 </div>
 
@@ -458,6 +500,8 @@ function switchTab(tab) {
   if (tab === "drafts") loadDrafts();
   if (tab === "sent") loadSent();
   if (tab === "received") loadReceived();
+  if (tab === "tracking") loadTracking();
+  if (tab === "analytics") renderAnalytics();
 }
 
 // ---------- connect ----------
@@ -998,6 +1042,165 @@ document.addEventListener("DOMContentLoaded", async () => {
     console.error("[PAD] init error:", e);
   }
 });
+
+// ---------- tracking (provider-first engagement) ----------
+// One round trip: /api/tracking returns totals, a dense per-day series, the
+// links, the leads, the statuses and the failures together.
+let TRK = null;
+let trkCharts = [];
+let ENG_TRACKING_DOMAIN = "";
+
+function trkCard(label, value, hint) {
+  return `<div style="min-width:104px;padding:8px 10px;border:1px solid rgba(128,128,128,.28);border-radius:8px">
+    <div style="font-size:11px;opacity:.7">${esc(label)}</div>
+    <div style="font-size:19px;font-weight:600">${esc(String(value))}</div>
+    ${hint ? `<div style="font-size:10px;opacity:.6">${esc(hint)}</div>` : ""}
+  </div>`;
+}
+
+function trkTable(rows, cols, empty) {
+  if (!rows || !rows.length) return `<div style="font-size:12px;opacity:.6">${esc(empty || "nothing yet")}</div>`;
+  const head = cols.map((c) => `<th style="text-align:left;padding:3px 8px 3px 0;font-size:11px;opacity:.7">${esc(c.label)}</th>`).join("");
+  const body = rows.map((r) => `<tr>${cols.map((c) => {
+    const v = typeof c.get === "function" ? c.get(r) : r[c.key];
+    return `<td style="padding:3px 8px 3px 0;font-size:12px">${esc(v === null || v === undefined || v === "" ? "—" : String(v))}</td>`;
+  }).join("")}</tr>`).join("");
+  return `<table style="border-collapse:collapse;width:100%"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
+}
+
+const trkShort = (u) => {
+  try { const x = new URL(u); return (x.host + x.pathname).replace(/^www\./, "").slice(0, 54); }
+  catch (e) { return String(u || "").slice(0, 54); }
+};
+
+// Chart.js is vendored under vendor/ and loaded from the pad's own origin: no CDN,
+// so nothing is fetched at runtime and incognito works. If it is missing the
+// tables still render — the panel degrades instead of breaking.
+async function trkEnsureChart() {
+  if (window.Chart) return true;
+  try {
+    await new Promise((resolve, reject) => {
+      const s = document.createElement("script");
+      s.src = "vendor/chart.umd.min.js";     // RELATIVE: the pad is served under a path prefix
+      s.onload = resolve;
+      s.onerror = reject;
+      document.head.appendChild(s);
+    });
+  } catch (e) { return false; }
+  return Boolean(window.Chart);
+}
+
+function trkDraw(id, cfg) {
+  const el = $(id);
+  if (!el || !window.Chart) return null;
+  try {
+    // Pass the ELEMENT, not a context: Chart.js 4 calls item.getContext('2d') itself.
+    const chart = new Chart(el, cfg);
+    trkCharts.push(chart);
+    return chart;
+  } catch (e) {
+    console.warn("chart failed:", e && e.message);
+    return null;
+  }
+}
+
+async function loadTracking() {
+  let d;
+  try { d = await api("api/tracking?days=30", authed("GET")); }
+  catch (e) { return setStatus("Could not load tracking: " + e.message, false); }
+  TRK = d;
+  renderTracking(d);
+}
+
+function renderTracking(d) {
+  const t = d.totals || {};
+  const eng = d.engagement || {};
+  const src = d.sources || {};
+  ENG_TRACKING_DOMAIN = src.tracking_domain || "";
+  const rate = (n) => (n === null || n === undefined ? "—" : n + "%");
+  $("trk_window").textContent = "last " + (d.window_days || 30) + " days";
+  $("trk_kpis").innerHTML = [
+    trkCard("Leads", t.leads), trkCard("Sent", t.sent), trkCard("Delivered", t.delivered),
+    trkCard("Bounced", t.bounced), trkCard("Replies", t.replies),
+    trkCard("Opens", t.opens, t.opened_messages + " messages"),
+    trkCard("Open rate", rate(t.open_rate), "soft hint"),
+    trkCard("Email clicks", t.email_clicks, t.clicked_messages + " messages"),
+    trkCard("Site clicks", src.clicks_tracked ? t.clicks : "not tracked", src.clicks_tracked ? "first-party" : "optional layer off"),
+    trkCard("Failures", t.errors),
+  ].join("");
+
+  const byDay = d.by_day || [];
+  $("trk_links").innerHTML = trkTable(d.top_links, [
+    { label: "link", get: (r) => trkShort(r.url) },
+    { label: "clicks", key: "clicks" },
+    { label: "leads", key: "leads" },
+  ], "no clicks yet");
+  $("trk_leads").innerHTML = trkTable(d.leads, [
+    { label: "lead", get: (r) => r.company || r.lead_id },
+    { label: "stage", key: "stage" },
+    { label: "sent", key: "sent" },
+    { label: "opens", key: "opens" },
+    { label: "clicks", key: "email_clicks" },
+    { label: "replies", key: "replies" },
+  ], "no leads yet");
+  $("trk_errors").innerHTML = trkTable(d.error_ops, [
+    { label: "operation", get: (r) => r.op || "(unlabelled)" },
+    { label: "count", key: "n" },
+    { label: "last", get: (r) => String(r.last_at || "").replace("T", " ").slice(0, 19) },
+  ], "no failures recorded");
+
+  // Provenance, so a zero is never mistaken for a measurement.
+  $("trk_provenance").innerHTML = trkTable([
+    { metric: "opens", source: "Resend open tracking (pixel on " + (ENG_TRACKING_DOMAIN || "the tracking subdomain") + ")", detail: "soft hint: a pixel proxy, not a read" },
+    { metric: "email clicks", source: "Resend click tracking on the mail's own links", detail: "registered only if the webhook subscribes email.clicked" },
+    { metric: "site clicks", source: "OPTIONAL first-party layer (tokenised links back to your site)", detail: src.attribution_enabled ? "mirror ok" : src.attribution_mirror },
+    { metric: "statuses", source: "Resend webhooks: delivered / bounced / complained", detail: "delivery state is never overwritten by an open" },
+  ], "");
+
+  const labels = byDay.map((r) => String(r.day).slice(5));
+  trkEnsureChart().then((ok) => {
+    $("trk_charts_note").style.display = ok ? "none" : "";
+    for (const c of trkCharts) { try { c.destroy(); } catch (e) { /* gone */ } }
+    trkCharts = [];
+    if (!ok) return;
+    trkDraw("trk_c_eng", {
+      type: "line",
+      data: { labels, datasets: [
+        { label: "opens", data: byDay.map((r) => r.opens || 0), borderWidth: 2, tension: .25 },
+        { label: "email clicks", data: byDay.map((r) => r.email_clicks || 0), borderWidth: 2, tension: .25 },
+      ] },
+      options: { responsive: true, maintainAspectRatio: false, animation: false,
+        plugins: { legend: { labels: { boxWidth: 10, font: { size: 11 } } } },
+        scales: { y: { beginAtZero: true, ticks: { precision: 0 } } } },
+    });
+    trkDraw("trk_c_mail", {
+      type: "bar",
+      data: { labels, datasets: [
+        { label: "sent", data: byDay.map((r) => r.sent || 0) },
+        { label: "delivered", data: byDay.map((r) => r.delivered || 0) },
+      ] },
+      options: { responsive: true, maintainAspectRatio: false, animation: false,
+        plugins: { legend: { labels: { boxWidth: 10, font: { size: 11 } } } },
+        scales: { x: { stacked: true }, y: { stacked: true, beginAtZero: true, ticks: { precision: 0 } } } },
+    });
+  });
+}
+
+function renderAnalytics() {
+  const rows = (TRK && TRK.statuses) || [];
+  $("an_table").innerHTML = trkTable([
+    { name: "Resend — mail, opens, clicks", desc: "the numbers on the Tracking tab", on: "connected", via: "webhook + API" },
+    { name: "Google Analytics 4", desc: "sessions, source/medium, conversions on the site", on: "not connected", via: "MCP" },
+    { name: "PostHog", desc: "product analytics and funnels", on: "not connected", via: "MCP" },
+  ], [
+    { label: "source", key: "name" }, { label: "what it gives", key: "desc" },
+    { label: "state", key: "on" }, { label: "wired via", key: "via" },
+  ], "");
+  $("an_statuses").innerHTML = trkTable(rows, [
+    { label: "status", key: "status" }, { label: "messages", key: "n" },
+  ], "no mail yet");
+}
+
 </script>
 </body>
 </html>

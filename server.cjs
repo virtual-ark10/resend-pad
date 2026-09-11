@@ -252,6 +252,79 @@ const SENT_LOG = path.join(DATA_DIR, 'sent-drafts.jsonl');
 // the kit still works.
 // ---------------------------------------------------------------------------
 const LEADS_CFG = (CFG.leads && typeof CFG.leads === 'object') ? CFG.leads : {};
+
+// The domains this instance owns. A shared Resend account sends for more than one
+// brand, so the webhook must be able to tell "mine" from "someone else's on the
+// same key" — otherwise another brand's opens and replies land in this CRM.
+// Configured as brand.domains, else derived from brand.siteUrl / from.
+const BRAND_DOMAINS = (() => {
+  const listed = Array.isArray(CFG.brand && CFG.brand.domains) ? CFG.brand.domains : [];
+  const fromSite = [];
+  for (const v of [CFG.brand && CFG.brand.siteUrl, CFG.from]) {
+    const m = String(v || '').match(/@?([a-z0-9.-]+\.[a-z]{2,})/i);
+    if (m && m[1]) fromSite.push(m[1].toLowerCase());
+  }
+  return Array.from(new Set(listed.concat(fromSite).map((d) => String(d).toLowerCase()).filter(Boolean)));
+})();
+
+function isBrandMail(...vals) {
+  const addrs = [];
+  for (const v of vals) {
+    if (Array.isArray(v)) addrs.push(...v);
+    else if (v != null) addrs.push(v);
+  }
+  if (!addrs.length) return true;              // nothing to judge: accept
+  if (!BRAND_DOMAINS.length) return true;      // single-brand instance: everything is ours
+  return addrs.some((a) => {
+    const m = String(a).match(/@?([a-z0-9.-]+\.[a-z]{2,})/i);
+    const host = m && m[1] ? m[1].toLowerCase() : '';
+    return host && BRAND_DOMAINS.some((d) => host === d || host.endsWith('.' + d));
+  });
+}
+
+// Resend's tracking subdomain: the host that carries the open pixel and the
+// rewritten links. It is configured per brand ON THE DOMAIN in Resend, not here, so
+// the pad only reports which one it belongs to — from config (tracking.trackingSubdomain)
+// or derived from the brand's first domain.
+const TRACKING_DOMAIN = (CFG.tracking && CFG.tracking.trackingSubdomain)
+  || (BRAND_DOMAINS[0] ? 'analytics.' + BRAND_DOMAINS[0] : '');
+
+// Scalar read (COUNT/MAX) off the store: node:sqlite returns a row object.
+const nowIso = () => new Date().toISOString();
+const val = (sql, ...args) => {
+  const row = store.get(sql, ...args);
+  return row ? Object.values(row)[0] : null;
+};
+
+// Site clicks live ONLY in the local attribution mirror, which is the OPTIONAL
+// layer. An instance that relies on Resend's own tracking has no mirror, and the
+// dashboard must say "not tracked" there instead of reporting a zero that looks
+// like a measurement.
+const OUTREACH_CFG = (CFG.outreach && typeof CFG.outreach === 'object') ? CFG.outreach : {};
+function clickStats() {
+  const out = { ok: false, minted: 0, total: 0, byLead: {}, byDay: {} };
+  const storePath = OUTREACH_CFG.storePath || process.env.ATTRIBUTION_STORE || '';
+  if (!OUTREACH_CFG.enabled || !storePath) return out;
+  try {
+    const raw = JSON.parse(fs.readFileSync(storePath, 'utf8'));
+    const rows = Array.isArray(raw.clicks) ? raw.clicks : [];
+    out.minted = rows.length;
+    for (const c of rows) {
+      const at = c && c.first_click_at;
+      if (!at) continue;                       // minted but never clicked
+      const day = String(at).slice(0, 10);
+      const lead = (c && c.lead_id) || '(unknown)';
+      out.total += 1;
+      out.byDay[day] = (out.byDay[day] || 0) + 1;
+      out.byLead[lead] = (out.byLead[lead] || 0) + 1;
+    }
+    out.ok = true;
+  } catch (e) {
+    console.warn('[TRACKING] attribution mirror unavailable:', e.message);
+    if (store) store.logFailure({ entity: 'system', op: 'tracking_clicks', error: e, actor: 'pad' });
+  }
+  return out;
+}
 const store = require('./db.cjs').open(DATA_DIR, {
   stages: LEADS_CFG.stages || CFG.stages,
   replyStage: LEADS_CFG.replyStage,
@@ -485,6 +558,61 @@ function verifyWebhook(rawBody, headers) {
   return ok ? { ok: true } : { ok: false, reason: 'signature mismatch' };
 }
 
+// Turn one Resend webhook into store writes. The type decides everything:
+//   email.received                     -> the reply, and the lead it belongs to
+//   email.opened | email.clicked       -> ENGAGEMENT (see the invariant below)
+//   email.delivered|bounced|complain.. -> the delivery status on the mail
+//
+// The invariant: an open or a click is a record of something that already
+// happened at the provider. It may NEVER move a stage and may NEVER write
+// emails.status. Routing an open to the delivery-status path (the shape this
+// code had before) overwrites 'delivered' with 'opened', which collapses the
+// funnel and lets a bounced message look opened.
+function handleWebhook(ev, receivedAt) {
+  const type = ev.type || 'unknown';
+  const d = ev.data || {};
+  const at = d.created_at || receivedAt || nowIso();
+  const out = { type, stored: null, skipped: null };
+  store.event('webhook', d.email_id || d.message_id || null, type, { type });
+  const addrs = [].concat(d.to || [], d.from || [], d.received_for || []);
+  if (!isBrandMail(...addrs)) { out.skipped = 'another brand on the shared Resend account'; return out; }
+
+  if (type === 'email.received') {
+    const saved = store.saveReply({
+      id: d.email_id || d.message_id, from: d.from, to: d.received_for || d.to,
+      subject: d.subject, text: d.text, html: d.html, message_id: d.message_id,
+      in_reply_to: d.in_reply_to || null, created_at: at, raw: ev,
+    });
+    out.stored = { reply_id: saved && saved.id, duplicate: !saved };
+    // A reply is exactly the case where nothing else may arrive for hours, so run
+    // the queue now instead of waiting for the next authenticated request.
+    if (store && rules) {
+      try { store.processEvents(rules); } catch (e) { console.warn('[EVENTS] drain after reply failed:', e.message); }
+    }
+  } else if (type === 'email.opened' || type === 'email.clicked') {
+    const c = d.click || {};
+    const kind = type === 'email.clicked' ? 'click' : 'open';
+    out.stored = store.recordEngagement({
+      resend_id: d.email_id || d.message_id || null,
+      kind,
+      url: c.link || d.link || null,
+      user_agent: c.userAgent || null,
+      ip: c.ipAddress || null,
+      // When it happened: a click carries its own timestamp, an open has none, so
+      // the event's creation time is the only honest clock — NOT the mail's
+      // created_at, which would file every open under the day it was sent.
+      at: c.timestamp || ev.created_at || at,
+      // Resend sends no event id: the retry key is built from the parts a retry
+      // repeats verbatim, so the same click twice is one row.
+      dedupe: [type, d.email_id || '', c.link || '', c.timestamp || ev.created_at || ''].join('|'),
+    });
+  } else if (/^email\.(delivered|bounced|complained|failed)$/.test(type)) {
+    store.updateEmailStatus(d.email_id, type.split('.')[1]);
+    out.stored = { status: type.split('.')[1], resend_id: d.email_id || null };
+  }
+  return out;
+}
+
 function appendWebhookLog(entry) {
   const line = JSON.stringify(entry);
   return new Promise((resolve) => {
@@ -581,21 +709,37 @@ function handleApi(req, res, url, ip) {
       const v = verifyWebhook(rawBody, req.headers);
       if (!v.ok) {
         console.warn('[WEBHOOK] Rejected:', v.reason);
+        if (store) store.logFailure({ entity: 'webhook', op: 'webhook_signature', error: new Error(v.reason), status: 400, actor: 'resend' });
         return sendJson(res, 400, { error: `Invalid webhook: ${v.reason}` });
       }
       let event;
-      try { event = JSON.parse(rawBody); } catch { return sendJson(res, 400, { error: 'bad json' }); }
+      try { event = JSON.parse(rawBody); } catch (e) {
+        if (store) store.logFailure({ entity: 'webhook', op: 'webhook_json', error: e, status: 400, actor: 'resend' });
+        return sendJson(res, 400, { error: 'bad json' });
+      }
+      let handled = null;
       if (store) {
         try {
-          const d = event.data || {};
-          if (d.email_id) store.updateEmailStatus(d.email_id, String(event.type || '').split('.').pop());
-          store.event('system', d.email_id || d.id || null, 'webhook', { type: event.type || 'unknown' });
-        } catch (e) { console.warn('[DB] webhook:', e.message); }
+          handled = handleWebhook(event, new Date().toISOString());
+          console.log(`[WEBHOOK] ${handled.type} stored=${JSON.stringify(handled.stored)}${handled.skipped ? ' skipped=' + handled.skipped : ''}`);
+        } catch (e) {
+          console.warn('[DB] webhook:', e.message);
+          store.logFailure({ entity: 'webhook', op: 'webhook_store', error: e, status: 500, actor: 'resend', extra: { type: event && event.type } });
+        }
+        // The queue is drained by the next authenticated request; a webhook is
+        // unauthenticated, so it does not drain here.
       }
       appendWebhookLog({ received_at: new Date().toISOString(), event }).then((written) => {
         console.log(`[WEBHOOK] ${event.type || 'unknown'} archived (${written ? 'OK' : 'WRITE FAILED'})`);
         if (!written) return sendJson(res, 500, { error: 'archive write failed' });
-        return sendJson(res, 200, { ok: true, type: event.type || 'unknown' });
+        // Echo what was stored: a webhook that silently did nothing is the failure
+        // mode this whole path exists to make visible.
+        return sendJson(res, 200, {
+          ok: true,
+          type: event.type || 'unknown',
+          stored: handled ? handled.stored : null,
+          skipped: handled ? handled.skipped : null,
+        });
       });
     });
   }
@@ -605,6 +749,7 @@ function handleApi(req, res, url, ip) {
   if (!PAD_TOKEN || auth !== PAD_TOKEN) {
     const mask = (s) => s ? s.slice(0, 4) + '…' + s.slice(-4) : '(none)';
     console.log(`[AUTH-FAIL] ${req.method} ${url} got=${mask(auth)} expected=${mask(PAD_TOKEN)}`);
+    if (store) store.logFailure({ entity: 'system', op: 'auth', error: new Error(PAD_TOKEN ? 'token mismatch' : 'PAD_TOKEN not configured'), status: 401, actor: 'pad', extra: { route: `${req.method} ${url}` } });
     return sendJson(res, 401, { error: 'Unauthorized — missing or invalid token' });
   }
 
@@ -613,6 +758,153 @@ function handleApi(req, res, url, ip) {
   if (p === '/api/crm' || p.startsWith('/api/crm/')) {
     if (!LEADS_ENABLED) return sendJson(res, 404, { error: 'Leads tab disabled in config.json' });
     return proxyCrm(req, res, '/api' + p.slice('/api/crm'.length));
+  }
+
+  // ---------------------------------------------------------------- tracking
+  // The dashboard's one round trip: mail numbers, engagement, the links that
+  // earned the clicks, and the failures, each derived from the rows.
+  if (req.method === 'GET' && p === '/api/tracking') {
+    const days = Math.max(1, Math.min(parseInt(new URL(url, 'http://x').searchParams.get('days') || '30', 10) || 30, 365));
+    const since = `-${days} days`;
+    // Engagement rows carry provider timestamps, so they filter on an ISO cutoff.
+    const sinceISO = new Date(Date.now() - days * 86400000).toISOString();
+
+    const mail = store.all(
+      `SELECT substr(COALESCE(sent_at, created_at), 1, 10) AS day,
+              SUM(CASE WHEN direction = 'out' THEN 1 ELSE 0 END) AS sent,
+              SUM(CASE WHEN status = 'delivered' THEN 1 ELSE 0 END) AS delivered,
+              SUM(CASE WHEN status = 'bounced' THEN 1 ELSE 0 END) AS bounced
+         FROM emails
+        WHERE substr(COALESCE(sent_at, created_at), 1, 10) >= date('now', ?)
+        GROUP BY day ORDER BY day`, since);
+
+    const replyDays = store.all(
+      `SELECT substr(COALESCE(received_at, created_at), 1, 10) AS day, COUNT(*) AS replies
+         FROM replies WHERE deleted_at IS NULL
+          AND substr(COALESCE(received_at, created_at), 1, 10) >= date('now', ?)
+        GROUP BY day ORDER BY day`, since);
+
+    const errorDays = store.all(
+      `SELECT substr(at, 1, 10) AS day, COUNT(*) AS errors
+         FROM events WHERE type = 'error' AND substr(at, 1, 10) >= date('now', ?)
+        GROUP BY day ORDER BY day`, since);
+
+    const clicks = clickStats();
+    const eng = store.engagementTotals(sinceISO);
+    const engDays = store.engagementSeries(sinceISO);
+    const engLeads = store.engagementByLead(sinceISO);
+    const topLinks = store.topLinks(sinceISO, 12);
+
+    // One dense point per day, so a quiet day plots as a zero, not a gap.
+    const byDay = new Map();
+    const dayOf = (d) => {
+      if (!byDay.has(d)) byDay.set(d, { day: d, sent: 0, delivered: 0, bounced: 0, replies: 0, clicks: 0, email_clicks: 0, opens: 0, errors: 0 });
+      return byDay.get(d);
+    };
+    for (const r of mail) Object.assign(dayOf(r.day), { sent: r.sent || 0, delivered: r.delivered || 0, bounced: r.bounced || 0 });
+    for (const r of replyDays) dayOf(r.day).replies = r.replies || 0;
+    for (const r of errorDays) dayOf(r.day).errors = r.errors || 0;
+    for (const [d, n] of Object.entries(clicks.byDay)) dayOf(d).clicks = n;
+    for (const r of engDays) Object.assign(dayOf(r.day), { opens: r.opens || 0, email_clicks: r.clicks || 0 });
+
+    const totals = {
+      leads: val('SELECT COUNT(*) FROM leads WHERE deleted_at IS NULL') || 0,
+      converted: val('SELECT COUNT(*) FROM leads WHERE converted = 1') || 0,
+      sent: val("SELECT COUNT(*) FROM emails WHERE direction = 'out'") || 0,
+      delivered: val("SELECT COUNT(*) FROM emails WHERE status = 'delivered'") || 0,
+      bounced: val("SELECT COUNT(*) FROM emails WHERE status = 'bounced'") || 0,
+      complained: val("SELECT COUNT(*) FROM emails WHERE status = 'complained'") || 0,
+      failed: val("SELECT COUNT(*) FROM emails WHERE status IN ('failed', 'rejected')") || 0,
+      replies: val('SELECT COUNT(*) FROM replies WHERE deleted_at IS NULL') || 0,
+      replied_leads: val("SELECT COUNT(DISTINCT lead_id) FROM replies WHERE deleted_at IS NULL AND lead_id IS NOT NULL") || 0,
+      clicks: clicks.total,                  // OPTIONAL layer: tokenised site links
+      clicks_minted: clicks.minted,
+      email_clicks: eng.email_clicks || 0,   // Resend click tracking on the mail's own links
+      opens: eng.opens || 0,                 // Resend open tracking
+      opened_messages: eng.opened_messages || 0,
+      clicked_messages: eng.clicked_messages || 0,
+      opened_leads: eng.opened_leads || 0,
+      clicked_leads: eng.clicked_leads || 0,
+      errors: val("SELECT COUNT(*) FROM events WHERE type = 'error'") || 0,
+    };
+    // Rates are per DELIVERED message — the denominator the funnel is built on.
+    const pct = (n, d) => (d ? Math.round((Number(n) / Number(d)) * 1000) / 10 : null);
+    totals.open_rate = pct(eng.opened_messages, totals.delivered);
+    totals.click_rate = pct(eng.clicked_messages, totals.delivered);
+
+    const statuses = store.all(
+      `SELECT COALESCE(status, 'unknown') AS status, COUNT(*) AS n
+         FROM emails WHERE direction = 'out' GROUP BY status ORDER BY n DESC`);
+
+    const campaigns = store.all(
+      `SELECT COALESCE(campaign, '(none)') AS campaign, COUNT(*) AS emails,
+              SUM(CASE WHEN direction = 'out' THEN 1 ELSE 0 END) AS sent,
+              SUM(CASE WHEN status = 'delivered' THEN 1 ELSE 0 END) AS delivered,
+              SUM(CASE WHEN status = 'bounced' THEN 1 ELSE 0 END) AS bounced
+         FROM emails GROUP BY campaign ORDER BY sent DESC LIMIT 12`);
+
+    const perLead = store.all(
+      `SELECT l.id AS lead_id, l.company, l.stage, l.last_contact_at,
+              (SELECT COUNT(*) FROM emails e WHERE e.lead_id = l.id AND e.direction = 'out') AS sent,
+              (SELECT COUNT(*) FROM replies r WHERE r.lead_id = l.id AND r.deleted_at IS NULL) AS replies,
+              (SELECT COUNT(*) FROM events v WHERE v.entity = 'lead' AND v.entity_id = l.id AND v.type = 'error') AS failures
+         FROM leads l WHERE l.deleted_at IS NULL
+        ORDER BY sent DESC, replies DESC, l.company LIMIT 15`);
+    const engByLead = new Map(engLeads.map((r) => [String(r.lead_id), r]));
+    for (const r of perLead) {
+      r.clicks = clicks.byLead[r.lead_id] || 0;
+      const e = engByLead.get(String(r.lead_id)) || {};
+      r.opens = e.opens || 0;
+      r.email_clicks = e.email_clicks || 0;
+    }
+
+    const errorOps = store.all(
+      `SELECT json_extract(payload, '$.op') AS op, COUNT(*) AS n, MAX(at) AS last_at
+         FROM events WHERE type = 'error' GROUP BY op ORDER BY n DESC LIMIT 12`);
+
+    const recentErrors = store.all(
+      `SELECT entity, entity_id, payload, at, actor FROM events
+        WHERE type = 'error' ORDER BY at DESC LIMIT 20`)
+      .map((r) => {
+        let pl = {};
+        try { pl = JSON.parse(r.payload || '{}'); } catch (e) { /* ignore */ }
+        return Object.assign({ entity: r.entity, entity_id: r.entity_id, at: r.at, actor: r.actor }, pl);
+      });
+
+    return sendJson(res, 200, {
+      generated_at: nowIso(),
+      window_days: days,
+      totals,
+      by_day: Array.from(byDay.values()).sort((a, b) => (a.day < b.day ? -1 : 1)),
+      statuses,
+      campaigns,
+      leads: perLead,
+      error_ops: errorOps,
+      recent_errors: recentErrors,
+      top_links: topLinks,
+      engagement: {
+        opens: eng.opens || 0,
+        email_clicks: eng.email_clicks || 0,
+        opened_messages: eng.opened_messages || 0,
+        clicked_messages: eng.clicked_messages || 0,
+        opened_leads: eng.opened_leads || 0,
+        clicked_leads: eng.clicked_leads || 0,
+        open_rate: totals.open_rate,
+        click_rate: totals.click_rate,
+      },
+      sources: {
+        // Provider-first: opens and link clicks come from Resend and work on any
+        // instance. Minted-link attribution is OPTIONAL — an instance without it
+        // is not degraded, it simply has no site-click number, and the UI says so
+        // instead of reporting a zero that looks like a measurement.
+        store: store.file,
+        tracking_domain: TRACKING_DOMAIN || null,
+        attribution_enabled: Boolean(clicks.ok),
+        attribution_mirror: clicks.ok ? 'ok' : (OUTREACH_CFG.enabled ? 'unavailable' : 'not configured'),
+        clicks_tracked: Boolean(clicks.ok),
+        email_clicks_tracked: true,
+      },
+    });
   }
 
   // Drain the event queue: whatever fired it (a send, a reply, a redraft, the
