@@ -959,6 +959,12 @@ async function loadTrackers() {
     if (!tk.openTracking) warnings.push("open tracking is off for this domain (Resend dashboard -> Domains -> Tracking)");
     if (!tk.clickTracking) warnings.push("click tracking is off for this domain");
     if (!tk.webhook_configured) warnings.push("no webhook signing secret set, so live opens/clicks arrive only when you press Refresh");
+    if ((tk.webhook_missing || []).length) {
+      warnings.push("the Resend webhook is not subscribed to " + tk.webhook_missing.join(", ")
+        + ", so opens and clicks will never arrive (subscribe them in Resend -> Webhooks, then press Refresh)");
+    } else if (tk.webhook_checked_at && tk.webhook_events && tk.webhook_events.length) {
+      warnings.push("webhook subscribed to " + tk.webhook_events.length + " event types, checked " + fmtDate(tk.webhook_checked_at));
+    }
     note.innerHTML = warnings.length
       ? "Only what Resend reports is shown. " + warnings.map(esc).join("; ") + ". Events recorded: " + fmtNum((s.recent || []).length) + " recent."
       : "Tracking is on and the webhook is configured. Events are recorded as Resend reports them.";

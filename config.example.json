@@ -81,8 +81,9 @@
     "_readme": "Resend domain tracking. Open and click tracking must also be enabled on the domain in the Resend dashboard, and delivery events need the webhook below pointed at this pad.",
     "openTracking": true,
     "clickTracking": true,
-    "trackingSubdomain": "links",
-    "publicBaseUrl": "https://example.com/pad"
+    "trackingSubdomain": "analytics",
+    "publicBaseUrl": "https://example.com/pad",
+    "_setup": "all three of these must be true, or opens/clicks silently never arrive: tracking enabled on the Resend domain, a verified CNAME for the tracking subdomain (analytics -> links1.resend-dns.com for eu-west-1), and the webhook subscribed to email.opened + email.clicked. See docs/TRACKERS.md."
   },
   "limits": {
     "ratePerMinute": 60,

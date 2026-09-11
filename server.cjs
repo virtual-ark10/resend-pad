@@ -356,7 +356,27 @@ function refreshTracking(limit = 100) {
         });
         if (res && res.stored) stored += 1; else skipped += 1;
       }
-      resolve({ ok: true, checked: items.length, stored, unchanged: skipped, at: new Date().toISOString() });
+      // Opens and clicks only ever arrive by webhook, so what the webhook is
+      // subscribed to decides whether the dashboard can see them at all. Check
+      // it while we are here and cache it, so the UI can warn instead of
+      // showing a silent zero.
+      resendRequest('GET', '/webhooks', null, (werr, wstatus, wbody) => {
+        const REQUIRED = ['email.opened', 'email.clicked'];
+        if (!werr && wstatus === 200) {
+          const list = (safeJson(wbody) || {}).data || [];
+          const active = list.filter((w) => w.status === 'enabled' || w.status === 'active');
+          const events = [...new Set(active.flatMap((w) => w.events || []))];
+          store.setMeta('tracking_webhook', {
+            at: new Date().toISOString(),
+            endpoints: active.map((w) => w.endpoint),
+            events,
+            missing: REQUIRED.filter((e) => !events.includes(e)),
+          });
+        } else if (werr) {
+          console.warn('[TRACK] could not read the webhook subscriptions:', werr.message);
+        }
+        resolve({ ok: true, checked: items.length, stored, unchanged: skipped, at: new Date().toISOString() });
+      });
     });
   });
 }
@@ -1143,6 +1163,9 @@ function handleApi(req, res, url, ip) {
           trackingSubdomain: TRACKING_CFG.trackingSubdomain || '',
           webhook_configured: !!WEBHOOK_SECRET,
           webhook_url: (TRACKING_CFG.publicBaseUrl || '') + '/api/webhook',
+          webhook_checked_at: (store.getMeta('tracking_webhook', {}) || {}).at || null,
+          webhook_events: (store.getMeta('tracking_webhook', {}) || {}).events || [],
+          webhook_missing: (store.getMeta('tracking_webhook', {}) || {}).missing || [],
         },
       }));
     });

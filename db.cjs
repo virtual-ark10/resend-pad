@@ -820,6 +820,20 @@ class Store {
     return { lead, activity: this.activity(id) };
   }
 
+  // ------------------------------------------------------------ meta store
+  getMeta(key, fallback = null) {
+    const row = this.get('SELECT value FROM meta WHERE key = ?', String(key));
+    if (!row) return fallback;
+    try { return JSON.parse(row.value); } catch (e) { return row.value; }
+  }
+
+  setMeta(key, value) {
+    this.run(`INSERT INTO meta(key, value) VALUES (?, ?)
+              ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+      String(key), typeof value === 'string' ? value : JSON.stringify(value));
+    return value;
+  }
+
   // ---------------------------------------------------- Resend tracking
   /**
    * Record one tracking event. Idempotent on (resend_id, type, occurred_at, url),

@@ -85,3 +85,42 @@ can safely re-send a window.
 | POST | `/api/trackers/refresh` | poll Resend for current statuses |
 | GET | `/api/analytics/summary?days=30` | provider cards with metrics, totals and any error |
 | POST | `/api/analytics/ingest` | MCP bridge |
+
+## Making opens and clicks actually arrive
+
+Three things must all be true at once, and each one fails silently:
+
+1. **Tracking is on for the domain** - Resend -> Domains -> the domain -> open
+   and click tracking. The domain object reports `open_tracking` /
+   `click_tracking`; the pad reads those into its own config.
+2. **A tracking subdomain is verified.** Click links and the open pixel are
+   rewritten to it, so without it nothing can be observed. This install uses
+   `analytics`:
+
+   ```
+   CNAME  analytics  ->  links1.resend-dns.com.   (region eu-west-1, status verified)
+   ```
+
+   Proof in a delivered message: the links read `https://analytics.starterlens.com/...`
+   and the injected open pixel is an `img` on the same host. The API shows
+   `tracking_subdomain: "analytics"` on the domain.
+3. **The webhook is subscribed to `email.opened` and `email.clicked`.** A Resend
+   webhook defaults to delivery events only, and an event it is not subscribed
+   to is never sent - the dashboard then shows zero opens forever with no error
+   anywhere. The pad checks the subscription on every Refresh and prints it in
+   the panel when a type is missing. To fix it:
+
+   ```bash
+   curl -X PATCH https://api.resend.com/webhooks/<webhook-id> \
+     -H "Authorization: Bearer $RESEND_API_KEY" -H 'Content-Type: application/json' \
+     -d '{"events":["email.sent","email.delivered","email.delivery_delayed","email.opened",
+                    "email.clicked","email.bounced","email.complained","email.failed","email.received"]}'
+   ```
+
+   Note: the PATCH reply is only `{object, id}` - it does not echo the events, so
+   read the webhook back with `GET /webhooks` to confirm. `email.canceled` is not
+   a valid event type and is rejected; `email.scheduled` is accepted.
+
+Without (2) the events cannot be generated; without (3) they are generated and
+thrown away. The `Refresh from Resend` button only recovers what `GET /emails`
+reports as `last_event`, which never includes opens or clicks.
