@@ -102,6 +102,16 @@
   .l-title { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .l-sub { font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .l-time { font-size: 12px; color: var(--muted); white-space: nowrap; }
+  .row-x {
+    flex: 0 0 auto; width: 24px; height: 24px; line-height: 1; font-size: 13px;
+    border: 1px solid var(--line); background: #fff; color: var(--muted);
+    border-radius: 6px; cursor: pointer; padding: 0;
+  }
+  .row-x:hover { background: #FEE4E2; border-color: #FDA29B; color: #B42318; }
+  .list-row.is-hidden { background: #FFFAEB; opacity: .7; }
+  .pager { display: flex; align-items: center; gap: 6px; }
+  .pager .pg { font-size: 12px; color: var(--muted); min-width: 56px; text-align: center; }
+  .pager button[disabled] { opacity: .45; cursor: not-allowed; }
   .empty { color: var(--muted); padding: 16px 12px; font-size: 13px; }
   .count { color: var(--muted); font-size: 12px; }
 
@@ -290,13 +300,33 @@
 
   <!-- ================= SENT ================= -->
   <section class="panel" id="panel-sent">
-    <h2 style="font-size:14px;margin:0 0 8px"><span id="lbl_sent">Sent emails</span> <span class="count" id="sent_count"></span></h2>
+    <div class="row-actions" style="margin:0 0 10px">
+      <h2 style="font-size:14px;margin:0"><span id="lbl_sent">Sent emails</span> <span class="count" id="sent_count"></span></h2>
+      <span style="flex:1"></span>
+      <button class="ghost" id="sent_hidden_btn" title="Review or restore what you cleared">Hidden: 0</button>
+      <button class="ghost" id="sent_clear_btn" title="Remove every message shown on this page">Clear shown</button>
+      <div class="pager">
+        <button class="ghost" id="sent_prev">‹ Newer</button>
+        <span class="pg" id="sent_page">page 1</span>
+        <button class="ghost" id="sent_next">Older ›</button>
+      </div>
+    </div>
     <div id="sent_list"></div>
   </section>
 
   <!-- ================= RECEIVED ================= -->
   <section class="panel" id="panel-received">
-    <h2 style="font-size:14px;margin:0 0 8px"><span id="lbl_received">Received (last 30 days)</span> <span class="count" id="recv_count"></span></h2>
+    <div class="row-actions" style="margin:0 0 10px">
+      <h2 style="font-size:14px;margin:0"><span id="lbl_received">Received (last 30 days)</span> <span class="count" id="recv_count"></span></h2>
+      <span style="flex:1"></span>
+      <button class="ghost" id="recv_hidden_btn" title="Review or restore what you cleared">Hidden: 0</button>
+      <button class="ghost" id="recv_clear_btn" title="Remove every message shown on this page">Clear shown</button>
+      <div class="pager">
+        <button class="ghost" id="recv_prev">‹ Newer</button>
+        <span class="pg" id="recv_page">page 1</span>
+        <button class="ghost" id="recv_next">Older ›</button>
+      </div>
+    </div>
     <div id="recv_list"></div>
   </section>
 
@@ -510,7 +540,7 @@ function renderTemplates() {
 
 // ---------- API ----------
 async function api(path, options) {
-  const res = await fetch(path, Object.assign({ headers: {} }, options || {}));
+  const res = await fetch(path, Object.assign({ credentials: "same-origin", headers: {} }, options || {}));
   if (res.status === 401) {
     setStatus("Not connected — enter the pad token above and click Connect.", false);
     throw new Error("unauthorized");
@@ -521,7 +551,12 @@ async function api(path, options) {
   return data;
 }
 function authed(method, body) {
-  return { method, headers: { "X-Pad-Token": token, "Content-Type": "application/json" }, body: body ? JSON.stringify(body) : undefined };
+  // The signed cookie the server sets rides along automatically (same-origin);
+  // the header is still attached whenever a token is in memory, so scripts, cron
+  // jobs and the browser can all use the same endpoints.
+  const headers = { "Content-Type": "application/json" };
+  if (token) headers["X-Pad-Token"] = token;
+  return { method, credentials: "same-origin", headers, body: body ? JSON.stringify(body) : undefined };
 }
 
 // ---------- tabs ----------
@@ -555,11 +590,31 @@ async function refreshConfig() {
   }
 }
 
+// Swap the typed pad token for the server's signed HttpOnly cookie, so this
+// browser stops asking for it. The cookie is NOT the token, it lasts a year, and
+// it survives the storage eviction (Safari ITP empties script-written storage
+// after about a week) that is the "I keep having to re-enter the key" symptom.
+async function exchangeSession(raw) {
+  try {
+    const r = await fetch("api/session", {
+      method: "POST", credentials: "same-origin",
+      headers: { "Content-Type": "application/json" }, body: JSON.stringify({ token: raw }),
+    });
+    return r.ok;
+  } catch (e) { return false; }
+}
+
 $("btn_connect").addEventListener("click", async () => {
   const raw = $("pad_token").value.trim();
   if (!raw) return setStatus("Enter the pad token.", false);
   token = raw;
   try { sessionStorage.setItem(TOKEN_KEY, token); } catch (e) {}
+  const sessionOk = await exchangeSession(raw);
+  if (!sessionOk) {
+    token = "";
+    try { sessionStorage.removeItem(TOKEN_KEY); } catch (e) {}
+    return setStatus("That token was rejected — check it and try again.", false);
+  }
   try {
     await refreshConfig(); // brand/labels/tabs/templates from config.json
     const d = await api("api/domains", authed("GET"));
@@ -819,25 +874,116 @@ async function discardDraft(id) {
 }
 
 // ---------- sent ----------
+// Resend's sent list has no page/offset — only `limit` (max 100) plus has_more —
+// so the pad fetches one window and pages through it locally.
+const SENT_PER_VIEW = 25;
+let sentItems = [], sentView = 0, sentHasMore = false, sentShowHidden = false;
+let sentMeta = { brandNote: "", hiddenNote: "", hiddenTotal: 0 };
+
+// ---------- clearing a row out of a list ----------
+// Resend keeps sent and received mail forever and has no delete endpoint for it,
+// so the ✕ records the id as cleared and the server filters it out of the list.
+// Reversible: press Hidden, then ↺ to put it back. Nothing is destroyed anywhere.
+async function clearRow(kind, id, subject, fromAddr) {
+  const label = subject ? subject : id;
+  if (!confirm("Remove this from the " + kind + " list?\n\n" + label +
+               "\n\nIt is NOT deleted in Resend — this only takes it out of the pad. " +
+               "Hidden (top right) shows what you removed and can put it back.")) return;
+  try {
+    await api("api/hidden", authed("POST", { id, kind, subject: subject || "", from_addr: fromAddr || "" }));
+    setStatus("Removed from " + kind + ". Press Hidden to review or restore it.", true);
+    if (kind === "sent") loadSent(); else loadReceived();
+  } catch (e) { setStatus("Could not remove it: " + e.message, false); }
+}
+
+async function restoreRow(kind, id) {
+  try {
+    await api("api/hidden/" + encodeURIComponent(id) + "?kind=" + kind, authed("DELETE"));
+    setStatus("Restored to " + kind + ".", true);
+    if (kind === "sent") loadSent(); else loadReceived();
+  } catch (e) { setStatus("Could not restore it: " + e.message, false); }
+}
+
+function toggleHidden(kind) {
+  if (kind === "sent") { sentShowHidden = !sentShowHidden; loadSent(); }
+  else { recvShowHidden = !recvShowHidden; loadReceived(); }
+}
+
+// "Clear shown": one request for everything visible on the current view, which is
+// what a screenful of junk needs. Same rule as the ✕ — hidden here, kept in Resend.
+async function clearShown(kind) {
+  const items = kind === "sent"
+    ? sentItems.slice(sentView * SENT_PER_VIEW, sentView * SENT_PER_VIEW + SENT_PER_VIEW)
+    : recvItems;
+  const ids = items.filter((m) => !m.hidden).map((m) => String(m.id));
+  if (!ids.length) return setStatus("Nothing left to clear on this view.", false);
+  if (!confirm("Remove the " + ids.length + " message(s) shown from the " + kind + " list?\n\n" +
+               "They stay in Resend — this only hides them in the pad, and the Hidden button can put them back.")) return;
+  try {
+    const r = await api("api/hidden", authed("POST", { ids, kind }));
+    setStatus("Removed " + r.hidden + " from " + kind + " (" + r.hidden_total + " hidden in total).", true);
+    if (kind === "sent") loadSent(); else loadReceived();
+  } catch (e) { setStatus("Could not clear them: " + e.message, false); }
+}
+
+function rowX(kind, m) {
+  const id = String(m.id);
+  const safe = (s) => esc(String(s || "").replace(/'/g, "\u2019"));
+  if (m.hidden) {
+    return '<button class="row-x" title="Put it back in the list" ' +
+      'onclick="event.stopPropagation();restoreRow(\'' + kind + '\',\'' + esc(id) + '\')">&#8634;</button>';
+  }
+  return '<button class="row-x" title="Remove from this list (stays in Resend)" ' +
+    'onclick="event.stopPropagation();clearRow(\'' + kind + '\',\'' + esc(id) + '\',\'' +
+    safe(m.subject || "") + '\',\'' + safe(m.from) + '\')">&times;</button>';
+}
+
+function hiddenNote(d, kind, showing) {
+  const total = d.hidden_total || 0, onPage = d.hidden_on_page || 0;
+  if (!total) return "";
+  return '<div class="empty" style="text-align:left">' + total + " message(s) cleared from this list" +
+    (onPage ? " (" + onPage + " on this page)" : "") +
+    (showing ? " — showing them now; press ↺ to restore one." : " — press Hidden to review or restore.") + "</div>";
+}
+
 async function loadSent() {
   const el = $("sent_list");
   if (!el) return;
   el.innerHTML = '<div class="empty">Loading…</div>';
   try {
-    const d = await api("api/sent", authed("GET"));
-    const items = d.data || [];
-    $("sent_count").textContent = "(" + items.length + ")";
-    if (items.length === 0) { el.innerHTML = '<div class="empty">No sent emails yet.</div>'; return; }
-    el.innerHTML = items.map((m) =>
-      `<div class="list-row" data-id="${esc(m.id)}" onclick="viewSent('${esc(String(m.id))}')">
-         <div class="l-main">
-           <div class="l-title">${esc(m.subject || "(no subject)")}</div>
-           <div class="l-sub">to ${esc((m.to || []).join(", "))}</div>
-         </div>
-         <div class="l-time">${fmtDate(m.created_at)}</div>
-         ${statusChip(m.last_event)}
-       </div>`).join("");
+    const d = await api("api/sent?limit=100" + (sentShowHidden ? "&show_hidden=1" : ""), authed("GET"));
+    sentItems = d.data || [];
+    sentHasMore = Boolean(d.has_more);
+    sentMeta = { hiddenNote: hiddenNote(d, "sent", sentShowHidden), hiddenTotal: d.hidden_total || 0 };
+    renderSentView();
   } catch (e) { el.innerHTML = '<div class="empty">' + esc(e.message) + "</div>"; }
+}
+
+// A view over the fetched window: paging never refetches, so it is instant.
+function renderSentView() {
+  const el = $("sent_list");
+  const views = Math.max(1, Math.ceil(sentItems.length / SENT_PER_VIEW));
+  if (sentView > views - 1) sentView = views - 1;
+  if (sentView < 0) sentView = 0;
+  const page = sentItems.slice(sentView * SENT_PER_VIEW, sentView * SENT_PER_VIEW + SENT_PER_VIEW);
+  $("sent_count").textContent = "(" + sentItems.length + ")";
+  $("sent_page").textContent = "page " + (sentView + 1) + " / " + views;
+  $("sent_prev").disabled = sentView <= 0;
+  $("sent_next").disabled = sentView >= views - 1;
+  $("sent_hidden_btn").textContent = "Hidden: " + sentMeta.hiddenTotal + (sentShowHidden ? " (shown)" : "");
+  const note = sentMeta.hiddenNote +
+    (sentHasMore ? '<div class="empty" style="text-align:left">Showing the newest 100 messages in one Resend page — older sent mail exists beyond this window.</div>' : "");
+  if (page.length === 0) { el.innerHTML = note + '<div class="empty">No sent emails to show.</div>'; return; }
+  el.innerHTML = note + page.map((m) =>
+    `<div class="list-row${m.hidden ? " is-hidden" : ""}" data-id="${esc(m.id)}" onclick="viewSent('${esc(String(m.id))}')">
+       ${rowX("sent", m)}
+       <div class="l-main">
+         <div class="l-title">${esc(m.subject || "(no subject)")}</div>
+         <div class="l-sub">to ${esc((m.to || []).join(", "))}</div>
+       </div>
+       <div class="l-time">${fmtDate(m.created_at)}</div>
+       ${statusChip(m.last_event)}
+     </div>`).join("");
 }
 async function viewSent(id) {
   try {
@@ -850,24 +996,38 @@ async function viewSent(id) {
 }
 
 // ---------- received ----------
+// Paging: Resend's receiving list is cursor-based (after/before), so the pad keeps
+// a stack of cursors — "Older" pushes the id of the last row of the raw page,
+// "Newer" walks back up the stack.
+let recvCursors = [""], recvIdx = 0, recvShowHidden = false, recvLastId = null, recvNextOk = false, recvItems = [];
+
 async function loadReceived() {
   const el = $("recv_list");
   if (!el) return;
   el.innerHTML = '<div class="empty">Loading…</div>';
+  const after = recvCursors[recvIdx] || "";
   try {
-    const d = await api("api/received?limit=50", authed("GET"));
-    const items = d.data || [];
+    const d = await api("api/received?limit=50" + (after ? "&after=" + encodeURIComponent(after) : "") +
+                        (recvShowHidden ? "&show_hidden=1" : ""), authed("GET"));
+    recvItems = d.data || [];
+    const items = recvItems;
+    recvLastId = d.last_id || null;
+    recvNextOk = (d.page_len || 0) >= (d.limit || 50);
     $("recv_count").textContent = "(" + items.length + ")";
-    if (items.length === 0) { el.innerHTML = '<div class="empty">No received emails. Make sure your domain MX points at Resend.</div>'; return; }
-    el.innerHTML = items.map((m) =>
-      `<div class="list-row" onclick="viewReceived('${esc(String(m.id))}')">
+    $("recv_page").textContent = "page " + (recvIdx + 1);
+    $("recv_prev").disabled = recvIdx === 0;
+    $("recv_next").disabled = !recvNextOk;
+    $("recv_hidden_btn").textContent = "Hidden: " + (d.hidden_total || 0) + (recvShowHidden ? " (shown)" : "");
+    const note = hiddenNote(d, "received", recvShowHidden);
+    if (items.length === 0) { el.innerHTML = note + '<div class="empty">No received emails on this page. Make sure your domain MX points at Resend.</div>'; return; }
+    el.innerHTML = note + items.map((m) =>
+      `<div class="list-row${m.hidden ? " is-hidden" : ""}" onclick="viewReceived('${esc(String(m.id))}')">
+         ${rowX("received", m)}
          <div class="l-main">
            <div class="l-title">${esc(m.subject || "(no subject)")}</div>
            <div class="l-sub">from ${esc(String(m.from || ""))}</div>
          </div>
          <div class="l-time">${fmtDate(m.created_at)}</div>
-         <span style="margin-left:6px;cursor:pointer;color:var(--err);font-size:16px;line-height:1" title="Delete reply"
-               onclick="event.stopPropagation();deleteReply('${esc(String(m.id))}')">✕</span>
        </div>`).join("");
   } catch (e) { el.innerHTML = '<div class="empty">' + esc(e.message) + "</div>"; }
 }
@@ -888,14 +1048,35 @@ async function viewReceived(id) {
   } catch (e) { setStatus("Failed to load email: " + e.message, false); }
 }
 
+// The ✕ on a received message, from the row or from the modal. Same rule as Sent:
+// cleared from this pad's list, still in Resend, and reversible from Hidden. The
+// server-side soft delete (DELETE /api/replies/:id) remains for callers that also
+// want the local reply record marked, and /api/received still honours it.
 async function deleteReply(id) {
-  if (!confirm("Delete this reply? It is removed from the pad (the record stays in the database for history).")) return;
+  if (!confirm("Remove this reply from the list?\n\nIt is NOT deleted in Resend — this only takes it out of the pad. " +
+               "Hidden (top right) can put it back.")) return;
   try {
-    await api("api/replies/" + encodeURIComponent(id), authed("DELETE"));
-    setStatus("Reply deleted.", true);
+    await api("api/hidden", authed("POST", { id, kind: "received" }));
+    setStatus("Removed from received. Press Hidden to review or restore it.", true);
     loadReceived();
-  } catch (e) { setStatus("Failed to delete: " + e.message, false); }
+  } catch (e) { setStatus("Could not remove it: " + e.message, false); }
 }
+
+// Pager + Hidden wiring for both lists.
+$("sent_prev").addEventListener("click", () => { if (sentView > 0) { sentView--; renderSentView(); } });
+$("sent_next").addEventListener("click", () => { sentView++; renderSentView(); });
+$("sent_hidden_btn").addEventListener("click", () => toggleHidden("sent"));
+$("sent_clear_btn").addEventListener("click", () => clearShown("sent"));
+$("recv_prev").addEventListener("click", () => { if (recvIdx > 0) { recvIdx--; loadReceived(); } });
+$("recv_next").addEventListener("click", () => {
+  if (!recvNextOk || !recvLastId) return;
+  recvCursors[recvIdx + 1] = recvLastId;
+  recvCursors = recvCursors.slice(0, recvIdx + 2);
+  recvIdx++;
+  loadReceived();
+});
+$("recv_hidden_btn").addEventListener("click", () => toggleHidden("received"));
+$("recv_clear_btn").addEventListener("click", () => clearShown("received"));
 function replyTo(addr, subject, messageId) {
   closeModal();
   switchTab("compose");
@@ -1272,6 +1453,19 @@ document.addEventListener("DOMContentLoaded", async () => {
       $("pad_token").value = token;
       const ok = await refreshConfig();
       if (!ok) setStatus("Could not load /api/config — using built-in defaults. Click Connect.", false);
+    } else {
+      // No token in this browser's storage: check for the server's signed cookie.
+      // It outlives the eviction that empties script-written storage, so after the
+      // first visit the pad opens straight into the data with nothing to type.
+      let r = { ok: false };
+      try { r = await fetch("api/session", { method: "GET", credentials: "same-origin" }); } catch (e) {}
+      if (r.ok) {
+        $("pad_token").value = "••••••••";
+        setStatus("Signed in with this browser's saved session.", true);
+        refreshConfig();
+      } else {
+        setStatus("Enter the pad token once — after that this browser stays signed in for a year.", false);
+      }
     }
     console.log("[PAD v" + PAD_VERSION + "] init OK; useCase=" + (CFG.useCase || "?") + "; token " + (token ? "present" : "absent"));
   } catch (e) {

@@ -574,6 +574,69 @@ function rateCheck(ip) {
   return b.count <= API_LIMIT;
 }
 
+// ---------------------------------------------------------------- pad session
+// The browser gets a signed, HttpOnly cookie instead of keeping the pad token in
+// localStorage: the token is typed once, and the cookie outlives the storage
+// eviction that clears script-written storage (Safari's ITP drops it after about
+// a week, which is exactly the "I have to keep entering the key" symptom). The
+// cookie value is NOT the token — it is an expiry plus an HMAC over that expiry,
+// keyed by the token, so a leaked cookie reveals nothing about the token itself.
+const SESSION_COOKIE = 'pad_session';
+const SESSION_TTL_DAYS = 365;
+const SESSION_TTL_MS = SESSION_TTL_DAYS * 24 * 60 * 60 * 1000;
+
+function signSession(exp) {
+  const mac = crypto.createHmac('sha256', PAD_TOKEN).update(String(exp)).digest('hex');
+  return `${exp}.${mac}`;
+}
+function sessionValid(req) {
+  if (!PAD_TOKEN) return false;
+  const raw = String(req.headers.cookie || '').split(';').map((c) => c.trim())
+    .find((c) => c.startsWith(SESSION_COOKIE + '='));
+  if (!raw) return false;
+  const val = decodeURIComponent(raw.slice(SESSION_COOKIE.length + 1));
+  const dot = val.lastIndexOf('.');
+  if (dot < 1) return false;
+  const exp = val.slice(0, dot);
+  const mac = val.slice(dot + 1);
+  const want = crypto.createHmac('sha256', PAD_TOKEN).update(String(exp)).digest('hex');
+  if (mac.length !== want.length) return false;
+  if (!crypto.timingSafeEqual(Buffer.from(mac), Buffer.from(want))) return false;
+  return Number(exp) > Date.now();
+}
+function setSessionCookie(res, req, clear) {
+  const proto = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim();
+  const secure = proto === 'https' ? '; Secure' : '';
+  const val = clear ? '' : signSession(Date.now() + SESSION_TTL_MS);
+  res.setHeader('Set-Cookie',
+    `${SESSION_COOKIE}=${encodeURIComponent(val)}; Path=/; HttpOnly; SameSite=Lax; ` +
+    `Max-Age=${clear ? 0 : Math.floor(SESSION_TTL_MS / 1000)}${secure}`);
+}
+
+// "Delete" on the Sent / Received tabs. Resend has no delete for mail that has
+// already gone out or already arrived, so the pad records the id in
+// hidden_messages and filters it out of the lists; the ✕ is reversible from the
+// same tab. Cursors are read from the raw page (before any hiding), or paging
+// would skip rows.
+function applyHidden(body, kind, showHidden) {
+  const items = body && Array.isArray(body.data) ? body.data : null;
+  if (!items || !store) return body;
+  let hidden;
+  try { hidden = new Set(store.hiddenIds(kind)); } catch (e) { return body; }
+  const kept = [];
+  let onPage = 0;
+  for (const m of items) {
+    if (hidden.has(String(m.id))) {
+      onPage++;
+      if (showHidden) kept.push(Object.assign({}, m, { hidden: true }));
+    } else kept.push(m);
+  }
+  return Object.assign({}, body, { data: kept, hidden_on_page: onPage });
+}
+function hiddenTotal(kind) {
+  try { return store ? store.hiddenMessages(kind).length : 0; } catch (e) { return 0; }
+}
+
 function sendJson(res, status, obj) {
   const body = JSON.stringify(obj);
   console.log(`  -> ${status} ${String(res.reqPath || '?')}`);
@@ -864,9 +927,45 @@ function handleApi(req, res, url, ip) {
     });
   }
 
-  // Everything else requires PAD_TOKEN
+  // ---- pad session -------------------------------------------------------
+  // The browser's way in: type the token once, get a signed HttpOnly cookie back.
+  if (p === '/api/session') {
+    if (req.method === 'GET') {
+      const ok = sessionValid(req);
+      return sendJson(res, ok ? 200 : 401, { ok, via: ok ? 'cookie' : null });
+    }
+    if (req.method === 'DELETE') {
+      setSessionCookie(res, req, true);
+      return sendJson(res, 200, { ok: true, cleared: true });
+    }
+    if (req.method === 'POST') {
+      return readBody(req, res, (body) => {
+        let data = {};
+        try { data = JSON.parse(body || '{}'); } catch (e) { return sendJson(res, 400, { error: 'Invalid JSON' }); }
+        const given = String(data.token || '').trim();
+        if (!PAD_TOKEN || given !== PAD_TOKEN) {
+          console.log(`[SESSION-DENY] ${req.socket.remoteAddress || '?'}`);
+          return sendJson(res, 401, { error: 'Unauthorized — wrong pad token' });
+        }
+        setSessionCookie(res, req, false);
+        return sendJson(res, 200, { ok: true, expires_in_days: SESSION_TTL_DAYS });
+      });
+    }
+  }
+
+  // ---- front-end config (branding, labels, tabs, templates) ---------------
+  // Public and ahead of the gate on purpose: the client reads this on load to
+  // render branding before anyone has signed in, and it carries no secrets (only
+  // booleans for what is configured).
+  if (req.method === 'GET' && p === '/api/config') {
+    return sendJson(res, 200, safeConfig());
+  }
+
+  // Everything else requires PAD_TOKEN — as the header (scripts, cron jobs) or as
+  // the signed session cookie the browser collected above.
   const auth = req.headers['x-pad-token'];
-  if (!PAD_TOKEN || auth !== PAD_TOKEN) {
+  const viaCookie = sessionValid(req);
+  if (!PAD_TOKEN || (auth !== PAD_TOKEN && !viaCookie)) {
     const mask = (s) => s ? s.slice(0, 4) + '…' + s.slice(-4) : '(none)';
     console.log(`[AUTH-FAIL] ${req.method} ${url} got=${mask(auth)} expected=${mask(PAD_TOKEN)}`);
     return sendJson(res, 401, { error: 'Unauthorized — missing or invalid token' });
@@ -888,10 +987,7 @@ function handleApi(req, res, url, ip) {
     } catch (e) { console.warn('[EVENTS] drain failed:', e.message); }
   }
 
-  // ---- Front-end config (branding, labels, tabs, templates, use case) ----
-  if (req.method === 'GET' && p === '/api/config') {
-    return sendJson(res, 200, safeConfig());
-  }
+  // ---- front-end config lives ABOVE the auth gate (see the /api/session block) ----
 
   if (req.method === 'POST' && p === '/api/send') {
     return readBody(req, res, (body) => {
@@ -956,35 +1052,104 @@ function handleApi(req, res, url, ip) {
   }
 
   if (req.method === 'GET' && p.startsWith('/api/sent')) {
-    const page = new URL(url, 'http://x').searchParams.get('page') || '1';
-    return resendRequest('GET', `/emails?page=${encodeURIComponent(page)}`, null, (err, status, rbody) => {
+    const q = new URL(url, 'http://x');
+    // Resend's sent list takes `limit` (max 100) and returns has_more — it has no
+    // page/offset and ignores cursors here, so this fetches one window and the
+    // client pages through it.
+    const limit = Math.min(Math.max(parseInt(q.searchParams.get('limit') || '100', 10) || 100, 1), 100);
+    const showHidden = q.searchParams.get('show_hidden') === '1';
+    return resendRequest('GET', `/emails?limit=${limit}`, null, (err, status, rbody) => {
       if (err) return sendJson(res, 502, { error: 'Failed to contact Resend', details: err.message });
-      sendJson(res, status, safeJson(rbody));
+      const payload = safeJson(rbody);
+      const raw = (payload && Array.isArray(payload.data)) ? payload.data : [];
+      const out = applyHidden(payload, 'sent', showHidden);
+      sendJson(res, status, Object.assign(out, {
+        limit,
+        fetched: raw.length,
+        hidden_total: hiddenTotal('sent'),
+        has_more: Boolean(payload && payload.has_more),
+      }));
     });
   }
 
   // Received emails (Resend receiving API)
   if (req.method === 'GET' && p === '/api/received') {
     const q = new URL(url, 'http://x');
-    const limit = q.searchParams.get('limit') || '50';
+    const limit = Math.min(Math.max(parseInt(q.searchParams.get('limit') || '50', 10) || 50, 1), 100);
     const after = q.searchParams.get('after') || '';
     const before = q.searchParams.get('before') || '';
-    let rp = `/emails/receiving?limit=${encodeURIComponent(limit)}`;
+    const showHidden = q.searchParams.get('show_hidden') === '1';
+    let rp = `/emails/receiving?limit=${limit}`;
     if (after) rp += `&after=${encodeURIComponent(after)}`;
     if (before) rp += `&before=${encodeURIComponent(before)}`;
     return resendRequest('GET', rp, null, (err, status, rbody) => {
       if (err) return sendJson(res, 502, { error: 'Failed to contact Resend', details: err.message });
       const payload = safeJson(rbody);
+      // Cursors come from the page BEFORE any hiding, so walking pages cannot
+      // skip rows when something on the page was cleared.
+      const raw = (payload && Array.isArray(payload.data)) ? payload.data : [];
       if (store && payload && Array.isArray(payload.data)) {
         // Persist what we just fetched (permanent record + lead linkage) and
         // hide anything the user deleted with the ✕ in the UI.
-        const hidden = new Set(store.deletedReplyIds());
+        const deleted = new Set(store.deletedReplyIds());
         for (const msg of payload.data) {
           try { store.saveReply(msg); } catch (e) { console.warn('[DB] saveReply:', e.message); }
         }
-        payload.data = payload.data.filter((msg) => !hidden.has(String(msg.id)));
+        payload.data = payload.data.filter((msg) => !deleted.has(String(msg.id)));
       }
-      sendJson(res, status, payload);
+      const out = applyHidden(payload, 'received', showHidden);
+      sendJson(res, status, Object.assign(out, {
+        limit,
+        page_len: raw.length,
+        first_id: raw.length ? raw[0].id : null,
+        last_id: raw.length ? raw[raw.length - 1].id : null,
+        hidden_total: hiddenTotal('received'),
+      }));
+    });
+  }
+
+  // ---- mail cleared from the two lists (the ✕ and "Clear shown") -----------
+  // These routes sit above the storeFail/withStore pair further down, so they get
+  // their own guard rather than hitting it in the temporal dead zone.
+  const withHiddenStore = (fn) => {
+    try { return fn(); } catch (e) {
+      console.warn('[DB] hidden route failed:', e.message);
+      return sendJson(res, 500, { error: 'store error', details: e.message });
+    }
+  };
+  if (req.method === 'GET' && p === '/api/hidden') {
+    if (!store) return sendJson(res, 503, { error: 'store unavailable' });
+    const kind = new URL(url, 'http://x').searchParams.get('kind') === 'received' ? 'received' : 'sent';
+    return withHiddenStore(() => sendJson(res, 200, { kind, data: store.hiddenMessages(kind) }));
+  }
+  if (req.method === 'POST' && p === '/api/hidden') {
+    if (!store) return sendJson(res, 503, { error: 'store unavailable' });
+    return readBody(req, res, (body) => {
+      let data = {};
+      try { data = JSON.parse(body || '{}'); } catch (e) { return sendJson(res, 400, { error: 'Invalid JSON' }); }
+      const kind = String(data.kind || '');
+      if (kind !== 'sent' && kind !== 'received') {
+        return sendJson(res, 400, { error: 'kind (sent|received) is required' });
+      }
+      // One id, or a batch of them, so a screenful of junk is one request.
+      const ids = Array.isArray(data.ids) ? data.ids.map(String).filter(Boolean).slice(0, 500)
+        : (data.id ? [String(data.id)] : []);
+      if (!ids.length) return sendJson(res, 400, { error: 'id or ids[] is required' });
+      return withHiddenStore(() => {
+        for (const id of ids) {
+          store.hideMessage({ id, kind, subject: data.subject, from_addr: data.from_addr, to_addr: data.to_addr, by: 'pad-ui' });
+        }
+        return sendJson(res, 200, { ok: true, kind, hidden: ids.length, hidden_total: store.hiddenMessages(kind).length });
+      });
+    });
+  }
+  if (req.method === 'DELETE' && p.startsWith('/api/hidden/')) {
+    if (!store) return sendJson(res, 503, { error: 'store unavailable' });
+    const id = decodeURIComponent(p.slice('/api/hidden/'.length));
+    const kind = new URL(url, 'http://x').searchParams.get('kind') === 'received' ? 'received' : 'sent';
+    return withHiddenStore(() => {
+      const ok = store.unhideMessage(id, kind);
+      return sendJson(res, ok ? 200 : 404, { ok, kind, hidden_total: store.hiddenMessages(kind).length });
     });
   }
 
@@ -1393,5 +1558,5 @@ function safeJson(raw) {
 server.listen(PORT, () => {
   const brand = (CFG.brand && CFG.brand.productName) || 'Email Pad';
   console.log(`✓ ${brand} running on http://127.0.0.1:${PORT} (useCase=${CFG.useCase}, outreach=${OUTREACH_ENABLED ? 'on' : 'off'})`);
-  console.log('  POST /api/send | GET /api/config | GET /api/domains | GET /api/sent | GET /api/received | POST /api/webhook | GET /api/archive | GET/PUT/DELETE /api/drafts | POST /api/drafts/:id/send | POST /api/drafts/:id/redraft | GET/DELETE /api/replies | GET/POST/PATCH /api/leads | GET /api/trackers/summary|events|refresh | GET /api/analytics/summary | POST /api/analytics/ingest | GET /api/emails | GET /api/stats');
+  console.log('  POST /api/send | GET /api/config | GET /api/domains | GET /api/sent | GET /api/received | POST /api/webhook | GET /api/archive | GET/PUT/DELETE /api/drafts | POST /api/drafts/:id/send | POST /api/drafts/:id/redraft | GET/DELETE /api/replies | GET/POST/DELETE /api/session | GET/POST/DELETE /api/hidden | GET/POST/PATCH /api/leads | GET /api/trackers/summary|events|refresh | GET /api/analytics/summary | POST /api/analytics/ingest | GET /api/emails | GET /api/stats');
 });

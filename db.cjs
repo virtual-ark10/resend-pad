@@ -17,7 +17,7 @@ const path = require('path');
 let DatabaseSync = null;
 try { ({ DatabaseSync } = require('node:sqlite')); } catch { DatabaseSync = null; }
 
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 4;
 
 const SCHEMA = `
 -- ---------------------------------------------------------------- leads
@@ -129,6 +129,26 @@ CREATE TABLE IF NOT EXISTS replies (
 );
 CREATE INDEX IF NOT EXISTS idx_replies_lead ON replies(lead_id, received_at);
 CREATE INDEX IF NOT EXISTS idx_replies_recv ON replies(received_at);
+
+-- ------------------------------------------------- mail cleared from the lists
+-- What the ✕ on the Sent and Received tabs removes. replies.deleted_at already
+-- covers *local* received mail, but both tabs list what Resend holds, and Resend
+-- has no delete for mail that has already gone out or already arrived — a sent
+-- message may not even have a local emails row (another app on the same Resend
+-- account sent it). So a cleared message is recorded here by kind, and both
+-- lists filter it out. It is reversible, and per kind, because the same id could
+-- in principle appear on both sides.
+CREATE TABLE IF NOT EXISTS hidden_messages (
+  id          TEXT NOT NULL,
+  kind        TEXT NOT NULL,                   -- 'sent' | 'received'
+  subject     TEXT,
+  from_addr   TEXT,
+  to_addr     TEXT,
+  hidden_at   TEXT NOT NULL,
+  hidden_by   TEXT,
+  PRIMARY KEY (id, kind)
+);
+CREATE INDEX IF NOT EXISTS idx_hidden_kind ON hidden_messages(kind, hidden_at);
 
 -- ------------------------------------------------------------- draft queue
 CREATE TABLE IF NOT EXISTS drafts (
@@ -676,6 +696,37 @@ class Store {
     this.run('UPDATE replies SET deleted_at = ?, is_read = 1 WHERE id = ?', nowIso(), id);
     this.event('reply', id, 'reply.deleted', { leadId: row.lead_id });
     return true;
+  }
+
+  // ---- mail cleared from the Sent / Received tabs --------------------------
+  // Both tabs list what Resend holds, so a cleared message is recorded here (and
+  // is reversible) rather than deleted anywhere: Resend has no delete for mail
+  // that has already gone out or already arrived.
+  hiddenIds(kind) {
+    return this.all('SELECT id FROM hidden_messages WHERE kind = ?', kind).map((r) => r.id);
+  }
+
+  hiddenMessages(kind) {
+    return this.all(`SELECT id, kind, subject, from_addr, to_addr, hidden_at, hidden_by
+                       FROM hidden_messages WHERE kind = ? ORDER BY hidden_at DESC`, kind);
+  }
+
+  hideMessage({ id, kind, subject, from_addr, to_addr, by = 'pad-ui' } = {}) {
+    if (!id || (kind !== 'sent' && kind !== 'received')) {
+      throw new Error('hideMessage needs an id and kind (sent|received)');
+    }
+    this.run(`INSERT INTO hidden_messages (id, kind, subject, from_addr, to_addr, hidden_at, hidden_by)
+              VALUES (?, ?, ?, ?, ?, ?, ?)
+              ON CONFLICT(id, kind) DO UPDATE SET hidden_at = excluded.hidden_at, hidden_by = excluded.hidden_by`,
+             String(id), kind, subject || null, from_addr || null, to_addr || null, nowIso(), by);
+    this.event('email', String(id), 'email.hidden', { kind, subject: subject || null, from: from_addr || null });
+    return true;
+  }
+
+  unhideMessage(id, kind) {
+    const r = this.run('DELETE FROM hidden_messages WHERE id = ? AND kind = ?', String(id), kind);
+    if (r && r.changes) this.event('email', String(id), 'email.unhidden', { kind });
+    return !!(r && r.changes);
   }
 
   listReplies({ leadId, includeDeleted = false, limit = 200 } = {}) {
