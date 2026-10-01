@@ -19,6 +19,10 @@ echo "== http: webhook -> store -> /api/tracking, and the client it serves =="
 node tests/tracking_http_test.cjs || fail=1
 
 echo
+echo "== boot: the pad and its leads engine opening one store at the same instant =="
+node tests/migration_race_test.cjs || fail=1
+
+echo
 if [ "$fail" -eq 0 ]; then
   echo "ALL SUITES PASSED"
 else

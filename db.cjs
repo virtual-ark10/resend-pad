@@ -308,7 +308,7 @@ CREATE INDEX IF NOT EXISTS ix_eng_host   ON email_engagements(kind, link_host);
 
 -- The questions the Tracking tab asks, answered from the rows themselves.
 DROP VIEW IF EXISTS v_engagement_daily;
-CREATE VIEW v_engagement_daily AS
+CREATE VIEW IF NOT EXISTS v_engagement_daily AS
 SELECT substr(at, 1, 10) AS day,
        kind,
        COUNT(*)                  AS n,
@@ -318,7 +318,7 @@ FROM email_engagements
 GROUP BY day, kind;
 
 DROP VIEW IF EXISTS v_top_links;
-CREATE VIEW v_top_links AS
+CREATE VIEW IF NOT EXISTS v_top_links AS
 SELECT COALESCE(link_host, '(unknown)') AS host,
        url,
        COUNT(*)                AS clicks,
@@ -331,7 +331,7 @@ GROUP BY url
 ORDER BY clicks DESC;
 
 DROP VIEW IF EXISTS v_engagement_by_lead;
-CREATE VIEW v_engagement_by_lead AS
+CREATE VIEW IF NOT EXISTS v_engagement_by_lead AS
 SELECT lead_id,
        SUM(CASE WHEN kind = 'open'  THEN 1 ELSE 0 END) AS opens,
        SUM(CASE WHEN kind = 'click' THEN 1 ELSE 0 END) AS email_clicks,
@@ -345,7 +345,7 @@ GROUP BY lead_id;
 
 -- Per message: what the Sent tab shows beside a mail ("opened 3x, clicked once").
 DROP VIEW IF EXISTS v_email_engagement;
-CREATE VIEW v_email_engagement AS
+CREATE VIEW IF NOT EXISTS v_email_engagement AS
 SELECT resend_id,
        SUM(CASE WHEN kind = 'open'  THEN 1 ELSE 0 END) AS opens,
        SUM(CASE WHEN kind = 'click' THEN 1 ELSE 0 END) AS clicks,
@@ -413,9 +413,21 @@ function open(dataDir, opts = {}) {
     const exists = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'events'").get();
     if (!exists) return;
     const cols = db.prepare('PRAGMA table_info(events)').all().map((c) => c.name);
-    if (!cols.includes('processed_at')) db.exec('ALTER TABLE events ADD COLUMN processed_at TEXT');
-    if (!cols.includes('attempts')) db.exec('ALTER TABLE events ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0');
-    if (!cols.includes('last_error')) db.exec('ALTER TABLE events ADD COLUMN last_error TEXT');
+    // Two processes open this store — the pad and its leads engine — so both can
+    // decide to add the same column at the same moment. The loser gets "duplicate
+    // column name", which means the column is there: the migration is done. Without
+    // this, the loser crashed on boot and was restarted by systemd.
+    const addColumn = (name, ddl) => {
+      if (cols.includes(name)) return;
+      try {
+        db.exec(`ALTER TABLE events ADD COLUMN ${ddl}`);
+      } catch (err) {
+        if (!/duplicate column name/i.test(String(err && err.message))) throw err;
+      }
+    };
+    addColumn('processed_at', 'processed_at TEXT');
+    addColumn('attempts', 'attempts INTEGER NOT NULL DEFAULT 0');
+    addColumn('last_error', 'last_error TEXT');
   });
   withRetry('schema', () => db.exec(SCHEMA));
   // Upsert: an existing store reports the version this build actually creates,
