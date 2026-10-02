@@ -436,7 +436,11 @@ function refreshTracking(limit = 100) {
       if (err) return resolve({ ok: false, error: err.message, stored: 0 });
       if (status !== 200) return resolve({ ok: false, error: `resend ${status}`, stored: 0 });
       const payload = safeJson(rbody) || {};
-      const items = Array.isArray(payload.data) ? payload.data : [];
+      // Shared Resend account: only this brand's sends may reach our tracker stats.
+      // Without this, another brand's bounces and failures land in OUR deliverability
+      // numbers, which is the one place a wrong number looks like a real problem.
+      const mine = brandFilter(payload, 'from');
+      const items = Array.isArray(mine.payload && mine.payload.data) ? mine.payload.data : [];
       let stored = 0;
       let skipped = 0;
       for (const item of items) {
@@ -471,7 +475,8 @@ function refreshTracking(limit = 100) {
         } else if (werr) {
           console.warn('[TRACK] could not read the webhook subscriptions:', werr.message);
         }
-        resolve({ ok: true, checked: items.length, stored, unchanged: skipped, at: new Date().toISOString() });
+        resolve({ ok: true, checked: items.length, stored, unchanged: skipped,
+                  hidden_other_brand: mine.hidden, at: new Date().toISOString() });
       });
     });
   });
