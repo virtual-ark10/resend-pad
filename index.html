@@ -985,8 +985,17 @@ function rowX(kind, m) {
 
 function hiddenNote(d, kind, showing) {
   const total = d.hidden_total || 0, onPage = d.hidden_on_page || 0;
-  if (!total) return "";
-  return '<div class="empty" style="text-align:left">' + total + " message(s) cleared from this list" +
+  const otherBrand = d.hidden_other_brand || 0;
+  // Other-brand mail is not cleared, it is not ours: on a shared Resend account the
+  // sent and receiving APIs return every brand's mail, and this line is how the user
+  // knows why the list is shorter than the Resend dashboard.
+  const brandLine = otherBrand
+    ? '<div class="empty" style="text-align:left">' + otherBrand +
+      " message(s) hidden here: they belong to another brand on this shared Resend account." +
+      "</div>"
+    : "";
+  if (!total) return brandLine;
+  return brandLine + '<div class="empty" style="text-align:left">' + total + " message(s) cleared from this list" +
     (onPage ? " (" + onPage + " on this page)" : "") +
     (showing ? " — showing them now; press ↺ to restore one." : " — press Hidden to review or restore.") + "</div>";
 }

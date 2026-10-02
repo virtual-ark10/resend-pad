@@ -282,6 +282,29 @@ function isBrandMail(...vals) {
   });
 }
 
+// Resend accounts get shared across brands, and the sent and receiving endpoints
+// return EVERY brand's mail on the same API key. The webhook path already drops other
+// brands (isBrandMail above), but these two lists did not, so another brand's
+// campaigns and inbox showed up in this pad. Filter them here and report what was
+// hidden, so nothing ever disappears without a line saying so.
+//   side 'from' = the sent list (judge the sender), 'to' = the received list.
+function brandFilter(payload, side) {
+  if (!payload || !Array.isArray(payload.data) || !BRAND_DOMAINS.length) {
+    return { payload, hidden: 0 };
+  }
+  const keep = [];
+  let hidden = 0;
+  for (const m of payload.data) {
+    const addrs = side === 'from'
+      ? [].concat(m.from || [], m.reply_to || [])
+      : [].concat(m.to || [], m.received_for || [], m.cc || []);
+    // No usable address: keep it. Showing a mystery beats hiding a real message.
+    if (!addrs.length || isBrandMail(...addrs)) keep.push(m);
+    else hidden += 1;
+  }
+  return { payload: Object.assign({}, payload, { data: keep }), hidden };
+}
+
 // Resend's tracking subdomain: the host that carries the open pixel and the
 // rewritten links. It is configured per brand ON THE DOMAIN in Resend, not here, so
 // the pad only reports which one it belongs to — from config (tracking.trackingSubdomain)
@@ -1360,11 +1383,13 @@ function handleApi(req, res, url, ip) {
       if (err) return sendJson(res, 502, { error: 'Failed to contact Resend', details: err.message });
       const payload = safeJson(rbody);
       const raw = (payload && Array.isArray(payload.data)) ? payload.data : [];
-      const out = applyHidden(payload, 'sent', showHidden);
+      const mine = brandFilter(payload, 'from');
+      const out = applyHidden(mine.payload, 'sent', showHidden);
       sendJson(res, status, Object.assign(out, {
         limit,
         fetched: raw.length,
         hidden_total: hiddenTotal('sent'),
+        hidden_other_brand: mine.hidden,
         has_more: Boolean(payload && payload.has_more),
       }));
     });
@@ -1386,22 +1411,27 @@ function handleApi(req, res, url, ip) {
       // Cursors come from the page BEFORE any hiding, so walking pages cannot
       // skip rows when something on the page was cleared.
       const raw = (payload && Array.isArray(payload.data)) ? payload.data : [];
-      if (store && payload && Array.isArray(payload.data)) {
+      // Another brand's mail is dropped before it is stored: persisting it would put
+      // someone else's inbox in this CRM's reply history, which is harder to undo
+      // than to prevent.
+      const mine = brandFilter(payload, 'to');
+      if (store && mine.payload && Array.isArray(mine.payload.data)) {
         // Persist what we just fetched (permanent record + lead linkage) and
         // hide anything the user deleted with the ✕ in the UI.
         const deleted = new Set(store.deletedReplyIds());
-        for (const msg of payload.data) {
+        for (const msg of mine.payload.data) {
           try { store.saveReply(msg); } catch (e) { console.warn('[DB] saveReply:', e.message); }
         }
-        payload.data = payload.data.filter((msg) => !deleted.has(String(msg.id)));
+        mine.payload.data = mine.payload.data.filter((msg) => !deleted.has(String(msg.id)));
       }
-      const out = applyHidden(payload, 'received', showHidden);
+      const out = applyHidden(mine.payload, 'received', showHidden);
       sendJson(res, status, Object.assign(out, {
         limit,
         page_len: raw.length,
         first_id: raw.length ? raw[0].id : null,
         last_id: raw.length ? raw[raw.length - 1].id : null,
         hidden_total: hiddenTotal('received'),
+        hidden_other_brand: mine.hidden,
       }));
     });
   }
