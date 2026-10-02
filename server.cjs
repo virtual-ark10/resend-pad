@@ -1365,7 +1365,19 @@ function handleApi(req, res, url, ip) {
   if (req.method === 'GET' && p === '/api/domains') {
     return resendRequest('GET', '/domains', null, (err, status, rbody) => {
       if (err) return sendJson(res, 502, { error: 'Failed to contact Resend', details: err.message });
-      sendJson(res, status, safeJson(rbody));
+      const payload = safeJson(rbody);
+      // Shared account: the domains list covers every brand on this Resend key, and
+      // the UI builds its "send as" picker from it. Offering another brand's domain
+      // here is how a brand ends up sending its outreach from someone else's domain.
+      if (payload && Array.isArray(payload.data) && BRAND_DOMAINS.length) {
+        const mine = payload.data.filter((d) => {
+          const name = String((d && d.name) || '').toLowerCase();
+          return BRAND_DOMAINS.some((b) => name === b || name.endsWith('.' + b));
+        });
+        payload.hidden_other_brand = payload.data.length - mine.length;
+        payload.data = mine;
+      }
+      sendJson(res, status, payload);
     });
   }
 
