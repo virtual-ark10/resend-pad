@@ -23,6 +23,10 @@ echo "== boot: the pad and its leads engine opening one store at the same instan
 node tests/migration_race_test.cjs || fail=1
 
 echo
+echo "== replies: a metadata-only inbound webhook, hydrated then never clobbered =="
+node tests/reply_body_hydration_test.cjs || fail=1
+
+echo
 if [ "$fail" -eq 0 ]; then
   echo "ALL SUITES PASSED"
 else

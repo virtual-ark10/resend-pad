@@ -876,6 +876,47 @@ function resendRequest(method, apiPath, body, cb) {
 }
 
 // ---------------------------------------------------------------------------
+// Inbound body hydration
+// ---------------------------------------------------------------------------
+// Resend's `email.received` webhook is METADATA ONLY: from, to, subject, ids. No
+// text, no html. A reply recorded straight from it keeps a subject and an empty
+// body, so anything reading the store (the CRM API, the follow-up loop, an
+// agent) sees a blank message. The body lives on GET /emails/receiving/:id;
+// fetch it and write it in. Only an EMPTY column is ever written, so a
+// re-delivered webhook cannot overwrite a body already stored, and a failed
+// fetch never loses the message: the row is already saved and the failure is
+// logged. The 200 acknowledgement waits for the fetch, so the row is complete
+// before the provider considers the event delivered.
+function fetchReceivedBody(resendId, cb) {
+  if (!resendId) return cb(new Error('no email_id on the event'));
+  return resendRequest('GET', `/emails/receiving/${encodeURIComponent(resendId)}`, null, (err, status, rbody) => {
+    if (err) return cb(err);
+    if (status >= 400) return cb(new Error('Resend returned ' + status));
+    let j = null;
+    try { j = JSON.parse(rbody); } catch (e) { j = null; }
+    if (!j) return cb(new Error('unparseable received email payload'));
+    if (!j.text && !j.html) return cb(new Error('received email has no text/html part'));
+    return cb(null, { text: j.text || null, html: j.html || null });
+  });
+}
+
+function hydrateInbound(event, stored, done) {
+  if (!store) return done(null, { skipped: 'no store' });
+  const d = (event && event.data) || {};
+  // replies.id IS the Resend email id in this store, so the reply id doubles as
+  // the key on the receiving endpoint.
+  const replyId = (stored && stored.reply_id) || d.email_id || null;
+  if (!replyId) return done(null, { skipped: 'no reply row to hydrate' });
+  if (d.text || d.html) return done(null, { reply_id: replyId, skipped: 'event carried the body' });
+  return fetchReceivedBody(d.email_id || replyId, (err, body) => {
+    if (err) return done(err, { reply_id: replyId, email_id: d.email_id || replyId });
+    let out;
+    try { out = store.hydrateReplyBody(replyId, body); } catch (e) { return done(e, { reply_id: replyId }); }
+    return done(null, Object.assign({ reply_id: replyId }, out));
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Svix webhook signature verification (Resend webhooks)
 // ---------------------------------------------------------------------------
 
@@ -1095,12 +1136,28 @@ function handleApi(req, res, url, ip) {
         if (!written) return sendJson(res, 500, { error: 'archive write failed' });
         // Echo what was stored: a webhook that silently did nothing is the failure
         // mode this whole path exists to make visible.
-        return sendJson(res, 200, {
+        const finish = (extra) => sendJson(res, 200, Object.assign({
           ok: true,
           type: event.type || 'unknown',
           stored: handled ? handled.stored : null,
           skipped: handled ? handled.skipped : null,
-        });
+        }, extra));
+        if (handled && event.type === 'email.received') {
+          return hydrateInbound(event, handled.stored, (herr, hres) => {
+            if (herr) {
+              console.warn('[WEBHOOK] body fetch failed:', herr.message);
+              if (store) store.logFailure({
+                entity: 'reply', entity_id: String((hres && hres.reply_id) || (event.data && event.data.email_id) || ''),
+                op: 'reply_body_fetch', error: herr, status: 502, actor: 'resend',
+                extra: { email_id: (event.data && event.data.email_id) || null, subject: (event.data && event.data.subject) || null },
+              });
+            } else if (hres && hres.updated) {
+              console.log(`[WEBHOOK] hydrated reply body for ${hres.reply_id}`);
+            }
+            return finish({ body: hres || null });
+          });
+        }
+        return finish();
       });
     });
   }
@@ -1502,7 +1559,18 @@ function handleApi(req, res, url, ip) {
     const id = p.slice('/api/received/'.length);
     return resendRequest('GET', `/emails/receiving/${encodeURIComponent(id)}`, null, (err, status, rbody) => {
       if (err) return sendJson(res, 502, { error: 'Failed to contact Resend', details: err.message });
-      sendJson(res, status, safeJson(rbody));
+      const j = safeJson(rbody) || {};
+      // Passive heal: this message may already be a reply row whose body was never
+      // captured (stored before the webhook hydrated bodies, or a fetch that failed
+      // at the time). Reading it here is reason enough to write it down, so opening
+      // a message in the pad also repairs the store.
+      try {
+        if (store && j.id && (j.text || j.html)) {
+          const h = store.hydrateReplyBody(j.id, { text: j.text || null, html: j.html || null });
+          if (h && h.updated) console.log(`[PAD] healed reply body for ${j.id} on view`);
+        }
+      } catch (e) { /* best effort: a heal must never break the read */ }
+      sendJson(res, status, j);
     });
   }
 

@@ -879,12 +879,43 @@ class Store {
         this.run('UPDATE leads SET updated_at = ? WHERE id = ?', nowIso(), lead);
       }
     } else {
-      // keep classification/stage/deleted state, refresh the body only
+      // keep classification/stage/deleted state, refresh the body only. The body
+      // columns are COALESCEd because a re-delivered webhook carries no text/html:
+      // writing the absent body straight through would blank a body that either
+      // hydrateReplyBody() or a human already filled in.
       this.run(`UPDATE replies SET lead_id=COALESCE(?, lead_id), from_addr=?, from_name=?, to_addr=?, subject=?,
-                body_text=?, body_html=?, message_id=?, in_reply_to=?, received_at=?, raw=? WHERE id=?`,
+                body_text=COALESCE(NULLIF(?,''), body_text), body_html=COALESCE(NULLIF(?,''), body_html),
+                message_id=?, in_reply_to=?, received_at=?, raw=? WHERE id=?`,
         ...vals.slice(0, 11), id);
     }
     return { id, leadId: lead, deleted: !!(existing && existing.deleted_at) };
+  }
+
+  /**
+   * Fill in a reply body that arrived as metadata only.
+   *
+   * Resend's `email.received` webhook carries from/to/subject/ids and NO text or
+   * html; the body lives on GET /emails/receiving/:id. Without this the row keeps
+   * a subject and an empty body, so anything reading the store (the CRM API, an
+   * agent, a follow-up loop) sees a blank message. Only an EMPTY column is
+   * written, so a re-delivered webhook can never overwrite a body already stored.
+   * Keyed by the Resend email id, which is this table's primary key.
+   */
+  hydrateReplyBody(id, { text, html } = {}) {
+    const key = String(id || '').trim();
+    if (!key || (!text && !html)) return { updated: 0 };
+    const sets = [];
+    const vals = [];
+    if (text) { sets.push("body_text = COALESCE(NULLIF(body_text,''), ?)"); vals.push(text); }
+    if (html) { sets.push("body_html = COALESCE(NULLIF(body_html,''), ?)"); vals.push(html); }
+    // The WHERE clause is what makes `updated` honest: a row whose body is already
+    // stored matches nothing, so a redundant hydrate reports 0 instead of reporting
+    // a match it did not change.
+    const r = this.run(
+      `UPDATE replies SET ${sets.join(', ')}
+       WHERE id = ? AND ((body_text IS NULL OR body_text = '') OR (body_html IS NULL OR body_html = ''))`,
+      ...vals, key);
+    return { updated: Number(r && r.changes) || 0 };
   }
 
   /** Ids deleted through the UI, so a live Resend listing can hide them. */
