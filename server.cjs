@@ -993,6 +993,36 @@ function readBody(req, res, cb) {
 // HTTP server
 // ---------------------------------------------------------------------------
 
+// ---- Static surface: an explicit allowlist ----
+// The pad's directory is both the web root and the checkout, so it holds .env,
+// .env.bak-* key backups, the SQLite store, logs and sources, and this handler is
+// reachable from the internet. A deployment of this file was swept by an
+// exposed-credential crawler that read /.env through it and then sent a foreign
+// campaign with the key it took. Serve files by name; refuse everything else.
+const PUBLIC_FILES = new Set([
+  '/index.html', '/landing.html', '/favicon.svg', '/apple-touch-icon.png',
+  '/icon-192.png', '/icon-512.png', '/og-image.png', '/robots.txt',
+  '/sitemap.xml', '/manifest.webmanifest',
+]);
+const PUBLIC_ASSET_EXT = ['.js', '.css', '.svg', '.png', '.ico', '.woff', '.woff2',
+  '.jpg', '.jpeg', '.webp'];
+
+function isPublicAsset(reqPath) {
+  if (typeof reqPath !== 'string' || !reqPath.startsWith('/') || reqPath.includes('\0')) return false;
+  let p;
+  try { p = decodeURIComponent(reqPath); } catch (_) { return false; }
+  if (p.includes('\0') || p.includes('..') || !p.startsWith('/')) return false;
+  const segs = p.split('/').filter(Boolean);
+  if (!segs.length) return false;
+  if (segs.some((s) => s.startsWith('.'))) return false;   // .env, .env.bak, .git, .DS_Store
+  if (segs.length === 1) return PUBLIC_FILES.has('/' + segs[0]);
+  if (segs.length === 2 && segs[0] === 'vendor') {
+    const lower = segs[1].toLowerCase();
+    return PUBLIC_ASSET_EXT.some((e) => lower.endsWith(e));
+  }
+  return false;
+}
+
 const server = http.createServer((req, res) => {
   const url = req.url || '/';
   const ip = req.socket.remoteAddress || 'unknown';
@@ -1019,10 +1049,13 @@ const server = http.createServer((req, res) => {
     }
   }
 
-  // ---- Static files (single-file front end + optional local assets) ----
-  let filePath = url.split('?')[0] === '/' ? '/index.html' : url.split('?')[0];
-  filePath = path.join(BASE_DIR, filePath);
-  const realPath = path.resolve(filePath);
+  // ---- Static files (named public assets only — see isPublicAsset) ----
+  const reqPath = url.split('?')[0] === '/' ? '/index.html' : url.split('?')[0];
+  if (!isPublicAsset(reqPath)) {
+    console.log('[SECURITY] static path denied:', url);
+    return forbidden(res, 'Forbidden');
+  }
+  const realPath = path.resolve(path.join(BASE_DIR, reqPath));
   const baseDir = path.resolve(BASE_DIR);
   if (!realPath.startsWith(baseDir)) {
     console.log('[SECURITY] Directory traversal blocked:', url);

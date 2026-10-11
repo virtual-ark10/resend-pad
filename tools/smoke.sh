@@ -127,5 +127,14 @@ curl -s -m 5 -X POST -H "$H" -H 'content-type: application/json' \
   "http://127.0.0.1:$PAD_PORT/api/analytics/ingest" | jget "d['ok']" | grep -q "True" || fail "ingest"
 get "http://127.0.0.1:$PAD_PORT/api/analytics/summary?days=7" | jget "[p['id'] for p in d['providers'] if p['configured']]" | grep -q "mcp" || fail "pushed points visible"
 
+echo "15. the web root serves assets and nothing else"
+curl -s -m 5 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PAD_PORT/index.html" | grep -q "^200$" || fail "index.html should be served"
+curl -s -m 5 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PAD_PORT/vendor/chart.umd.min.js" | grep -q "^200$" || fail "vendored asset should be served"
+for p in /.env /.env.bak-keyrotation /server.cjs /db.cjs /hooks.cjs /watchdog.log /data/outreach.db /snapshots/ /docs/ /tests/; do
+  code="$(curl -s -m 5 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PAD_PORT$p")"
+  [ "$code" = "403" ] || fail "static path $p must be refused, got $code"
+done
+
 echo
-echo "OK: pad + engine + the event loop + trackers + analytics behave."
+echo "OK: pad + engine + the event loop + trackers + analytics behave, and the web root"
+echo "    serves only the front end and its assets (no .env, store, sources or logs)."
