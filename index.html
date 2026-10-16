@@ -223,7 +223,7 @@
 
   <nav class="tabs" id="tabs"></nav>
   <!-- ================= LEADS (CRM) ================= -->
-  <section class="panel" id="panel-crm">
+  <section class="panel" id="panel-leads">
     <h2 style="font-size:14px;margin:0 0 8px">Leads <span class="count" id="crm_count"></span>
       <button class="ghost" id="btn_crm_sync" style="float:right;font-size:12px;padding:4px 10px">Sync email</button>
     </h2>
@@ -1366,7 +1366,7 @@ const STAGE_FALLBACK = [
 ];
 let crm = { leads: [], meta: null, stage: "", q: "", sel: null, detail: null };
 
-function isCrmOpen() { return $("panel-crm") && $("panel-crm").classList.contains("active"); }
+function isCrmOpen() { return $("panel-leads") && $("panel-leads").classList.contains("active"); }
 function stageList() {
   return (crm.meta && crm.meta.stages) || STAGE_FALLBACK.map(([key, label, color]) => ({ key, label, color }));
 }
