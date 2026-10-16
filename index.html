@@ -499,6 +499,10 @@ function merge(base, over) {
 let CFG = DEFAULTS;
 let token = "";
 try { token = sessionStorage.getItem(TOKEN_KEY) || ""; } catch (e) { /* storage blocked */ }
+// True once this page is actually let in — by a typed token OR by the signed session
+// cookie. The cookie path deliberately keeps `token` empty in memory, so `!token` is
+// NOT an auth check and must never be used as one.
+let padAuthed = false;
 let attachments = [];
 let editorHTML = "";
 let activeTabId = "";
@@ -685,7 +689,11 @@ $("btn_connect").addEventListener("click", async () => {
     if (cfgFrom) sel.insertAdjacentHTML("afterbegin", `<option value="${esc(cfgFrom)}">${esc(cfgFrom)}</option>`);
     if (doms.length === 0) setStatus("Connected, but no verified sender domains in Resend yet.", true);
     else setStatus("Connected! Verified senders loaded.", true);
-    loadDrafts(); loadSent(); loadReceived();
+    padAuthed = true;
+    // The leads panel is what a fresh load lands on, and it used to be filled only by a tab
+    // click, so the pad opened on "Loading leads…". Load it with the rest; the panel is
+    // cheap (two proxied calls) and is already populated if the user goes there later.
+    loadDrafts(); loadSent(); loadReceived(); loadCRM();
   } catch (e) {
     setStatus("Connection failed: " + e.message, false);
   }
@@ -1380,7 +1388,10 @@ function ago(ts) {
 }
 
 async function loadCRM() {
-  if (!token) return;
+  // NOT `if (!token)`: with the signed session cookie the token is intentionally empty in
+  // memory, so that guard returned early and the Leads tab sat on "Loading leads…" for every
+  // cookie-signed-in browser — including clicking away and back, which hits the same guard.
+  if (!padAuthed) return;
   try {
     const qs = crm.stage ? "?stage=" + encodeURIComponent(crm.stage) : "";
     const [m, l] = await Promise.all([crmApi("/meta"), crmApi("/leads" + qs)]);
