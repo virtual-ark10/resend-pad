@@ -366,7 +366,18 @@
   <!-- Third-party analytics are listed as NOT connected on purpose: the numbers
        are wired over MCP later. Nothing is faked to fill the space. -->
   <section class="panel" id="panel-analytics">
-    <h2 style="font-size:14px;margin:0 0 8px"><span id="lbl_analytics">Analytics</span></h2>
+    <h2 style="font-size:14px;margin:0 0 8px"><span id="lbl_analytics">Analytics</span>
+      <span style="float:right;font-size:12px;font-weight:400">
+        <select id="analytics_days" class="mini" title="Window">
+          <option value="7">7 days</option>
+          <option value="30" selected>30 days</option>
+          <option value="90">90 days</option>
+        </select>
+        <button class="ghost" id="btn_analytics_refresh" style="font-size:12px;padding:4px 10px">Refresh</button>
+      </span>
+    </h2>
+    <div class="sub" id="analytics_note" style="margin:0 0 10px"></div>
+    <div id="analytics_providers"></div>
     <div id="an_table"></div>
     <div style="font-size:12px;opacity:.75;margin:14px 0 4px">Mail status (all time)</div>
     <div id="an_statuses"></div>
@@ -402,21 +413,6 @@
     </div>
     <h3 class="sec">Recent events</h3>
     <div id="tracker_events"></div>
-  </section>
-
-  <section class="panel" id="panel-analytics">
-    <h2 style="font-size:14px;margin:0 0 8px">Analytics
-      <span style="float:right;font-size:12px;font-weight:400">
-        <select id="analytics_days" class="mini" title="Window">
-          <option value="7">7 days</option>
-          <option value="30" selected>30 days</option>
-          <option value="90">90 days</option>
-        </select>
-        <button class="ghost" id="btn_analytics_refresh" style="font-size:12px;padding:4px 10px">Refresh</button>
-      </span>
-    </h2>
-    <div class="sub" id="analytics_note" style="margin:0 0 10px"></div>
-    <div id="analytics_providers"></div>
   </section>
 
 <div class="modal-mask" id="modal_mask">
