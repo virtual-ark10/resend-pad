@@ -1518,6 +1518,10 @@ document.addEventListener("DOMContentLoaded", async () => {
       $("pad_token").value = token;
       const ok = await refreshConfig();
       if (!ok) setStatus("Could not load /api/config — using built-in defaults. Click Connect.", false);
+      // A valid stored token also means "let in": the tab the pad lands on is Leads, and
+      // refreshConfig() already re-rendered the tabs while padAuthed was still false, so
+      // the panel has to be filled here or a returning browser opens on "Loading leads…".
+      else { padAuthed = true; loadCRM(); }
     } else {
       // No token in this browser's storage: check for the server's signed cookie.
       // It outlives the eviction that empties script-written storage, so after the
@@ -1527,6 +1531,11 @@ document.addEventListener("DOMContentLoaded", async () => {
       if (r.ok) {
         $("pad_token").value = "••••••••";
         setStatus("Signed in with this browser's saved session.", true);
+        // Set this BEFORE refreshConfig(): the cookie is the auth, and refreshConfig()
+        // re-renders the tabs, lands on the Leads panel and calls loadCRM(). Left false,
+        // every browser that signs in by cookie (i.e. every returning visit) opened on
+        // "Loading leads…" while the server was answering 200 the whole time.
+        padAuthed = true;
         refreshConfig();
       } else {
         setStatus("Enter the pad token once — after that this browser stays signed in for a year.", false);
